@@ -165,18 +165,18 @@ def get_git_version_info():
     :return:
     """
     # Fetch the last tag
-    last_tag = subprocess.check_output(["git", "describe", "--tags", "--abbrev=0"]).strip().decode("utf-8")
+    last_tag = 696969#subprocess.check_output(["git", "describe", "--tags", "--abbrev=0"]).strip().decode("utf-8")
     # Fetch the current commit ID
-    current_commit = subprocess.check_output(["git", "rev-parse", "--verify", "--short", "HEAD"]).strip().decode("utf-8")
+    current_commit = 696969#subprocess.check_output(["git", "rev-parse", "--verify", "--short", "HEAD"]).strip().decode("utf-8")
 
     # Create a long and short version string to return
     short_version_string = last_tag
     long_version_string = last_tag
 
     # Fetch the amount of commits since the last tag
-    distance_since_last_tag = subprocess.check_output(
-        ["git", "rev-list", last_tag + "..HEAD", "--count"]
-    ).strip().decode("utf-8")
+    distance_since_last_tag = 420#subprocess.check_output(
+    #    ["git", "rev-list", last_tag + "..HEAD", "--count"]
+    #).strip().decode("utf-8")
 
     # Normalize short version string (saves getting spammed with useless warnings from setuptools about it)
     if '-alpha' in short_version_string.lower():
@@ -196,12 +196,12 @@ def get_git_version_info():
         long_version_string = '{}~{}'.format(long_version_string, current_commit)
 
     # Check if there are uncommitted changes on the directory
-    git_diff_status = subprocess.check_output(
-        "git diff-index --quiet HEAD -- ':!README.md' || echo 'is_dirty'", shell=True
-    ).strip().decode("utf-8")
-    if git_diff_status == 'is_dirty':
-        # There are commits since the last tag
-        long_version_string = '{}+dirty'.format(long_version_string)
+    #git_diff_status = subprocess.check_output(
+    #    "git diff-index --quiet HEAD -- ':!README.md' || echo 'is_dirty'", shell=True
+    #).strip().decode("utf-8")
+    #if git_diff_status == 'is_dirty':
+    #    # There are commits since the last tag
+    #    long_version_string = '{}+dirty'.format(long_version_string)
 
     return_dic = {
         'short': short_version_string,

@@ -1,6 +1,7 @@
 #not proudly written by gemini because i am not looking at this DIABOLICAL code
 # --- STAGE 1: Builder ---
 FROM python:3.10-slim AS builder
+RUN apt install git -y
 WORKDIR /build-area
 COPY . .
 # Hier wird das Wheel erzeugt, das vorher gefehlt hat

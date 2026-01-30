@@ -45,19 +45,19 @@ def name():
 
 
 def version():
-    if is_git_vcs():
+    #if is_git_vcs():
         git_version_info = get_git_version_info()
         return git_version_info['short']
-    else:
-        return str(version_info.__version__)
+    #else:
+    #    return str(version_info.__version__)
 
 
 def full_version():
-    if is_git_vcs():
+    #if is_git_vcs():
         git_version_info = get_git_version_info()
         return git_version_info['long']
-    else:
-        return str(version_info.__version__)
+    #else:
+    #    return str(version_info.__version__)
 
 
 def description():
@@ -92,7 +92,8 @@ def is_pre_release():
     :return:
     """
     full_version_string = full_version()
-    return "alpha" in full_version_string.lower() or "beta" in full_version_string.lower()
+    #return "alpha" in full_version_string.lower() or "beta" in full_version_string.lower()
+    return False
 
 
 def dev_status():
@@ -102,14 +103,14 @@ def dev_status():
 
     :return:
     """
-    full_version_string = full_version()
-    if 'alpha' in full_version_string.lower():
-        return 'Development Status :: 3 - Alpha'
-    elif 'beta' in full_version_string or 'rc' in full_version_string.lower():
-        return 'Development Status :: 4 - Beta'
-    else:
-        return 'Development Status :: 5 - Production/Stable'
-
+    #full_version_string = full_version()
+    #if 'alpha' in full_version_string.lower():
+    #    return 'Development Status :: 3 - Alpha'
+    #elif 'beta' in full_version_string or 'rc' in full_version_string.lower():
+    #    return 'Development Status :: 4 - Beta'
+    #else:
+    #    return 'Development Status :: 5 - Production/Stable'
+    return "Development Status :: 5 - Production/Stable"
 
 def changes():
     """
@@ -141,9 +142,9 @@ def is_git_vcs():
 
     :return:
     """
-    if subprocess.call(["git", "branch"], stderr=subprocess.STDOUT, stdout=open(os.devnull, 'w')) != 0:
-        return False
-    else:
+    #if subprocess.call(["git", "branch"], stderr=subprocess.STDOUT, stdout=open(os.devnull, 'w')) != 0:
+    #    return False
+    #else:
         return True
 
 

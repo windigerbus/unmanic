@@ -1,0 +1,39 @@
+#not proudly written by gemini because i am not looking at this DIABOLICAL code
+# --- STAGE 1: Builder ---
+FROM python:3.10-slim AS builder
+WORKDIR /build-area
+COPY . .
+# Hier wird das Wheel erzeugt, das vorher gefehlt hat
+RUN pip install build && python -m build --wheel --outdir /dist
+
+# --- STAGE 2: Final Image ---
+FROM lsiobase/ubuntu:jammy
+LABEL maintainer="Josh.5 <jsunnex@gmail.com>"
+
+# ... (Hier bleibt dein ganzer ENV und APT-Kram von oben exakt gleich!) ...
+# ... (Überspringe beim Ersetzen einfach bis zu den Requirements) ...
+
+# Ab hier wird es wieder wichtig:
+COPY requirements.txt /tmp/requirements.txt
+
+RUN \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        grc gcc python3 python3-dev python3-pip python3-setuptools unzip && \
+    python3 -m pip install --no-cache-dir -r /tmp/requirements.txt && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# JETZT DER TRICK:
+# Wir kopieren nicht mehr vom Host-Ordner /dist (den es nicht gibt),
+# sondern aus unserer "builder" stage von oben!
+COPY --from=builder /dist/ /src/
+
+RUN \
+    echo "**** Install Unmanic ****" && \
+    python3 -m pip install --no-cache-dir /src/*.whl && \
+    mv -f /usr/local/bin/unmanic /usr/local/bin/unmanic-service && \
+    mkdir -p /library
+
+# Den Rest wie gehabt
+COPY /docker/root /
+EXPOSE 8888/tcp

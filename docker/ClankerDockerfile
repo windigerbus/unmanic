@@ -6,7 +6,7 @@ WORKDIR /build-area
 COPY . .
 ENV VERSION=0.0.0-pirated-i-guess
 # Hier wird das Wheel erzeugt, das vorher gefehlt hat
-RUN pip install build && python -m build --wheel --outdir /dist
+RUN pip install build && python -m build --wheel --no-isolation --outdir /dist
 
 # --- STAGE 2: Final Image ---
 FROM lsiobase/ubuntu:jammy

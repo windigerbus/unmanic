@@ -35,7 +35,7 @@ import shutil
 import subprocess
 import sys
 import glob
-from setuptools import setup, find_packages, Command
+from setuptools import setup, find_packages, Command, find_namespace_packages
 import setuptools.command.build_py
 
 if sys.version_info[0] < 3:
@@ -58,14 +58,13 @@ module_classifiers = [
     versioninfo.dev_status(),
     'Intended Audience :: End Users/Desktop',
     'Intended Audience :: Developers',
-    'Programming Language :: Python :: 3.7',
     'Programming Language :: Python :: 3.8',
     'Programming Language :: Python :: 3.9',
     'Programming Language :: Python :: 3.10',
     'Programming Language :: Python :: 3.11',
+    'Programming Language :: Python :: 3.12',
     'Operating System :: POSIX :: Linux',
     'Operating System :: Unix',
-    'License :: OSI Approved :: GNU General Public License v3 (GPLv3)',
     'Topic :: Multimedia :: Video :: Conversion',
     'Topic :: Internet :: WWW/HTTP',
 ]
@@ -190,6 +189,8 @@ def requirements_dev():
 setup(
     name=module_name,
     version=module_version,
+    license="GPL-3.0-only",
+    license_files=("LICENSE",),
     author=module_author,
     author_email=module_email,
     maintainer=module_author,
@@ -201,7 +202,8 @@ setup(
     extras_require={
         'dev': requirements_dev()
     },
-    packages=[src_dir],
+    packages=find_namespace_packages(include=[f"{src_dir}*"]),
+    include_package_data=True,
     entry_points={
         'console_scripts': [
             '%s=%s.service:main' % (module_name, module_name)

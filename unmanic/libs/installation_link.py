@@ -40,10 +40,14 @@ from requests.auth import HTTPBasicAuth
 from requests_toolbelt import MultipartEncoder
 
 from unmanic import config
-from unmanic.libs import common, session, task, unlogger
+from unmanic.libs import common, session, task
+from unmanic.libs.frontend_push_messages import FrontendPushMessages
 from unmanic.libs.library import Library
+from unmanic.libs.logs import UnmanicLogging
+from unmanic.libs.plugins import PluginsHandler
 from unmanic.libs.session import Session
 from unmanic.libs.singleton import SingletonType
+from unmanic.libs.task import TaskDataStore
 
 
 class RequestHandler:
@@ -81,8 +85,7 @@ class Links(object, metaclass=SingletonType):
     def __init__(self, *args, **kwargs):
         self.settings = config.Config()
         self.session = session.Session()
-        unmanic_logging = unlogger.UnmanicLogger.__call__()
-        self.logger = unmanic_logging.get_logger(__class__.__name__)
+        self.logger = UnmanicLogging.get_logger(name=__class__.__name__)
 
     def _log(self, message, message2='', level="info"):
         message = common.format_message(message, message2)
@@ -821,13 +824,13 @@ class Links(object, metaclass=SingletonType):
 
         return installations_with_info
 
-    def within_enabled_link_limits(self, frontend_messages=None):
+    def within_enabled_link_limits(self):
         """
         Ensure enabled plugins are within limits
 
-        :param frontend_messages:
         :return:
         """
+        frontend_messages = FrontendPushMessages()
         # Fetch level from session
         s = Session()
         s.register_unmanic()
@@ -840,7 +843,7 @@ class Links(object, metaclass=SingletonType):
         def add_frontend_message():
             # If the frontend messages queue was included in request, append a message
             if frontend_messages:
-                frontend_messages.put(
+                frontend_messages.add(
                     {
                         'id':      'linkedInstallationLimits',
                         'type':    'error',
@@ -1183,8 +1186,8 @@ class RemoteTaskManager(threading.Thread):
     start_time = None
     finish_time = None
 
-    worker_subprocess_percent = None
-    worker_subprocess_elapsed = None
+    worker_subprocess_percent = '0'
+    worker_subprocess_elapsed = '0'
 
     worker_runners_info = {}
 
@@ -1208,8 +1211,7 @@ class RemoteTaskManager(threading.Thread):
         self.paused_flag.clear()
 
         # Create logger for this worker
-        unmanic_logging = unlogger.UnmanicLogger.__call__()
-        self.logger = unmanic_logging.get_logger(self.name)
+        self.logger = UnmanicLogging.get_logger(name=__class__.__name__)
 
     def _log(self, message, message2='', level="info"):
         message = common.format_message(message, message2)
@@ -1249,6 +1251,21 @@ class RemoteTaskManager(threading.Thread):
         self.current_task = current_task
         self.worker_log = []
 
+        # Execute event plugin runners
+        event_data = {
+            "library_id":               self.current_task.get_task_library_id(),
+            "task_id":                  self.current_task.get_task_id(),
+            "task_type":                self.current_task.get_task_type(),
+            "task_schedule_type":       "remote",
+            "remote_installation_info": {
+                'uuid':    self.installation_info.get("installation_uuid"),
+                'address': self.installation_info.get("remote_address"),
+            },
+            "source_data":              self.current_task.get_source_data()
+        }
+        plugin_handler = PluginsHandler()
+        plugin_handler.run_event_plugins_for_plugin_type('events.task_scheduled', event_data)
+
     def __unset_current_task(self):
         self.current_task = None
         self.worker_runners_info = {}
@@ -1261,7 +1278,7 @@ class RemoteTaskManager(threading.Thread):
         :return:
         """
         # Set the progress to an empty string
-        self.worker_subprocess_percent = ''
+        self.worker_subprocess_percent = '0'
         self.worker_subprocess_elapsed = '0'
 
         # Log the start of the job
@@ -1362,7 +1379,7 @@ class RemoteTaskManager(threading.Thread):
         library_path = library.get_path()
 
         # Check if we can create the remote task with just a relative path
-        #   only create checksum and send file if the remote library path cannot accept relative paths or
+        #   only create checksum and send file if the remote library path cannot accept relative paths, or
         #   it is configured for only receiving remote files
         send_file = False
         library_config = self.links.get_the_remote_library_config_by_name(self.installation_info, library_name)
@@ -1595,6 +1612,12 @@ class RemoteTaskManager(threading.Thread):
         # Save the completed command log
         self.current_task.save_command_log(self.worker_log)
 
+        # Update task state
+        task_state = data.get('task_state')
+        self.logger.warn("Importing task_state into TaskDataStore: %s", task_state)
+        if task_state:
+            TaskDataStore.import_task_state(self.current_task.get_task_id(), task_state)
+
         # Fetch remote task file
         if data.get('task_success'):
             task_label = data.get('task_label')
@@ -1602,31 +1625,36 @@ class RemoteTaskManager(threading.Thread):
                 "Remote task #{} was successful, proceeding to download the completed file '{}'".format(remote_task_id,
                                                                                                         task_label),
                 level='debug')
-            # Set the new file out as the extension may have changed
-            split_file_name = os.path.splitext(data.get('abspath'))
-            file_extension = split_file_name[1].lstrip('.')
-            self.current_task.set_cache_path(cache_directory, file_extension)
-            # Read the updated cache path
-            task_cache_path = self.current_task.get_cache_path()
+            if os.path.exists(data.get('abspath')):
+                # /library/tvshows/show_name/season/unmanic_remote_pending_library/file.mkv
+                task_cache_path = data.get('abspath')
+                self.current_task.cache_path = task_cache_path
+            else:
+                # Set the new file out as the extension may have changed
+                split_file_name = os.path.splitext(data.get('abspath'))
+                file_extension = split_file_name[1].lstrip('.')
+                self.current_task.set_cache_path(cache_directory, file_extension)
+                # Read the updated cache path
+                task_cache_path = self.current_task.get_cache_path()
 
-            # Loop until we are able to upload the file to the remote installation
-            while not self.redundant_flag.is_set():
-                # Check for network transfer lock
-                lock_key = self.links.acquire_network_transfer_lock(address, transfer_limit=2, lock_type='receive')
-                if not lock_key:
-                    self.event.wait(1)
-                    continue
-                # Download the file
-                self._log("Downloading file from remote installation '{}'".format(task_label), level='debug')
-                success = self.links.fetch_remote_task_completed_file(self.installation_info, remote_task_id, task_cache_path)
-                self.links.release_network_transfer_lock(lock_key)
-                if not success:
-                    self._log("Failed to download file '{}'".format(os.path.basename(data.get('abspath'))), level='error')
-                    # Send request to terminate the remote worker then return
-                    self.links.remove_task_from_remote_installation(self.installation_info, remote_task_id)
-                    self.__write_failure_to_worker_log()
-                    return False
-                break
+                # Loop until we are able to upload the file to the remote installation
+                while not self.redundant_flag.is_set():
+                    # Check for network transfer lock
+                    lock_key = self.links.acquire_network_transfer_lock(address, transfer_limit=2, lock_type='receive')
+                    if not lock_key:
+                        self.event.wait(1)
+                        continue
+                    # Download the file
+                    self._log("Downloading file from remote installation '{}'".format(task_label), level='debug')
+                    success = self.links.fetch_remote_task_completed_file(self.installation_info, remote_task_id, task_cache_path)
+                    self.links.release_network_transfer_lock(lock_key)
+                    if not success:
+                        self._log("Failed to download file '{}'".format(os.path.basename(data.get('abspath'))), level='error')
+                        # Send request to terminate the remote worker then return
+                        self.links.remove_task_from_remote_installation(self.installation_info, remote_task_id)
+                        self.__write_failure_to_worker_log()
+                        return False
+                    break
 
             # If the previous loop was broken because this tread needs to terminate, return False here (did not complete)
             if self.redundant_flag.is_set():

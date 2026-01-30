@@ -33,6 +33,7 @@ import random
 
 from unmanic.config import Config
 from unmanic.libs import common
+from unmanic.libs.frontend_push_messages import FrontendPushMessages
 from unmanic.libs.unmodels import EnabledPlugins, Libraries, LibraryPluginFlow, Plugins, Tags, Tasks
 
 
@@ -146,21 +147,23 @@ class Library(object):
         return default_library + sorted(libraries, key=lambda d: d['name'])
 
     @staticmethod
-    def within_library_count_limits(frontend_messages=None):
+    def within_library_count_limits():
         # Fetch level from session
         from unmanic.libs.session import Session
         s = Session()
         s.register_unmanic()
-        if s.level > 1:
-            return True
 
-        # Fetch all enabled plugins
-        library_count = Libraries.select().count()
+        frontend_messages = FrontendPushMessages()
 
-        def add_frontend_message():
-            # If the frontend messages queue was included in request, append a message
-            if frontend_messages:
-                frontend_messages.put(
+        if s.level <= 1:
+            # Fetch all enabled plugins
+            library_count = Libraries.select().count()
+
+            # Ensure enabled plugins are within limits
+            # Function was returned above if the user was logged in and able to use infinite
+            if library_count > s.library_count:
+                # If the frontend messages queue was included in request, append a message
+                frontend_messages.add(
                     {
                         'id':      'libraryEnabledLimits',
                         'type':    'error',
@@ -169,12 +172,10 @@ class Library(object):
                         'timeout': 0
                     }
                 )
+                return False
 
-        # Ensure enabled plugins are within limits
-        # Function was returned above if the user was logged in and able to use infinite
-        if library_count > s.library_count:
-            add_frontend_message()
-            return False
+        # If the frontend messages queue was included in request, remove the notification as we are currently within limits
+        frontend_messages.remove_item('libraryEnabledLimits')
         return True
 
     @staticmethod
@@ -259,6 +260,13 @@ class Library(object):
 
         :return:
         """
+        from unmanic.libs import task as task_module
+
+        select_query = Tasks.select(Tasks.id).where(Tasks.library_id == self.model.id)
+        task_ids = [task_row.id for task_row in select_query]
+        for task_id in task_ids:
+            task_module.TaskDataStore.clear_task(task_id)
+
         Tasks.delete().where(Tasks.library_id == self.model.id).execute()
 
     def get_id(self):

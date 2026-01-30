@@ -31,7 +31,7 @@
 """
 import threading
 import uuid
-from queue import Queue
+from queue import Queue, Empty
 
 from unmanic.libs.singleton import SingletonType
 
@@ -89,11 +89,13 @@ class Notifications(Queue, metaclass=SingletonType):
     """
 
     def _init(self, maxsize):
+        self._lock = threading.RLock()
         self.all_items = set()
         Queue._init(self, maxsize)
 
-    def __add_to_queue(self, item, block=True, timeout=None):
-        Queue.put(self, item, block, timeout)
+    def __add_to_queue_locked(self, item):
+        # Add the item to the queue without blocking (lock already held)
+        Queue.put_nowait(self, item)
 
     @staticmethod
     def __validate_item(item):
@@ -111,26 +113,33 @@ class Notifications(Queue, metaclass=SingletonType):
             )
         return True
 
-    def __get_all_items(self):
+    def __get_all_items_locked(self):
         items = []
-        while not self.empty():
-            items.append(self.get())
+        while True:
+            try:
+                # Get all items out of queue
+                items.append(self.get_nowait())
+            except Empty:
+                break
         return items
 
-    def __requeue_items(self, items):
+    def __requeue_items_locked(self, items):
+        # Add all given items back into the queue
         for item in items:
-            self.__add_to_queue(item)
+            Queue.put_nowait(self, item)
 
     def add(self, item):
         # Ensure received item is valid
         self.__validate_item(item)
-        # Generate uuid if one is not provided
-        if not item.get('uuid'):
-            item['uuid'] = str(uuid.uuid4())
-        # If it is not already in message list, add it to the list and the queue
-        if item.get('uuid') not in self.all_items:
-            self.all_items.add(item.get('uuid'))
-            self.__add_to_queue(item)
+        with self._lock:
+            # Generate uuid if one is not provided
+            if not item.get('uuid'):
+                item['uuid'] = str(uuid.uuid4())
+            # If it is not already in message list, add it to the list and the queue
+            if item['uuid'] in self.all_items:
+                return
+            self.all_items.add(item['uuid'])
+            self.__add_to_queue_locked(item)
 
     def remove(self, item_uuid):
         """
@@ -139,55 +148,54 @@ class Notifications(Queue, metaclass=SingletonType):
         :param item_uuid:
         :return:
         """
-        success = False
-        # Get all items out of queue
-        current_items = self.__get_all_items()
-        # Create list of items that will be queued again
-        requeue_items = []
-        for current_item in current_items:
-            if current_item.get('uuid') != item_uuid:
-                requeue_items.append(current_item)
-        # Remove the requested item UUID from the all_items set
-        lock = threading.RLock()
-        lock.acquire()
-        if item_uuid in self.all_items:
-            self.all_items.remove(item_uuid)
-            success = True
-        lock.release()
-        # Add all requeue_items items back into the queue
-        self.__requeue_items(requeue_items)
-        return success
+        with self._lock:
+            success = False
+            # Get all items out of queue
+            current_items = self.__get_all_items_locked()
+            # Create list of items that will be queued again
+            requeue_items = []
+            for current_item in current_items:
+                if current_item.get('uuid') != item_uuid:
+                    requeue_items.append(current_item)
+                else:
+                    success = True
+            if success and item_uuid in self.all_items:
+                self.all_items.remove(item_uuid)
+            # Add all requeue_items items back into the queue
+            self.__requeue_items_locked(requeue_items)
+            return success
 
     def read_all_items(self):
-        # Get all items out of queue
-        current_items = self.__get_all_items()
-        # Add all requeue_items items back into the queue
-        self.__requeue_items(current_items)
-        # Return items list
-        return current_items
+        with self._lock:
+            # Get all items out of queue
+            current_items = self.__get_all_items_locked()
+            # Add all requeue_items items back into the queue
+            self.__requeue_items_locked(current_items)
+            # Return items list
+            return list(current_items)
 
     def update(self, item):
         # Ensure received item is valid
         self.__validate_item(item)
-        # Generate uuid if one is not provided
-        if not item.get('uuid'):
-            item['uuid'] = str(uuid.uuid4())
-        # If it is not already in message list, add it to the list and the queue
-        if item.get('uuid') not in self.all_items:
-            self.all_items.add(item.get('uuid'))
-            self.__add_to_queue(item)
-        else:
-            # Get all items out of queue
-            current_items = self.__get_all_items()
-            # Create list of items that will be queued again
-            # This will not include the item requested for update
-            lock = threading.RLock()
-            lock.acquire()
+        with self._lock:
+            # Generate uuid if one is not provided
+            if not item.get('uuid'):
+                item['uuid'] = str(uuid.uuid4())
+            current_items = self.__get_all_items_locked()
             requeue_items = []
+            replaced = False
             for current_item in current_items:
-                if current_item.get('uuid') != item.get('uuid'):
+                if current_item.get('uuid') == item['uuid']:
+                    requeue_items.append(item)
+                    replaced = True
+                else:
                     requeue_items.append(current_item)
-                    continue
-                requeue_items.append(item)
+            if not replaced:
+                self.all_items.add(item['uuid'])
+                # Restore original queue state before adding new item
+                self.__requeue_items_locked(current_items)
+                self.__add_to_queue_locked(item)
+                return
+            self.all_items.add(item['uuid'])
             # Add all requeue_items items back into the queue
-            self.__requeue_items(requeue_items)
+            self.__requeue_items_locked(requeue_items)

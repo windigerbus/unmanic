@@ -52,7 +52,7 @@ class BaseApiError(Exception):
     Manage errors handled by the BaseApiHandler
     """
 
-    def __init___(self, errmsg):
+    def __init__(self, errmsg):
         Exception.__init__(self, errmsg)
 
 
@@ -207,7 +207,7 @@ class BaseApiHandler(RequestHandler):
         self.set_status(self.STATUS_ERROR_METHOD_NOT_ALLOWED)
         self.finish(response)
 
-    def action_route(self):
+    async def action_route(self):
         """
         Determine the handler method for the route.
         Execute that handler method.
@@ -244,7 +244,7 @@ class BaseApiHandler(RequestHandler):
                                                                              route.get("call_method"), params["path_args"],
                                                                              params["path_kwargs"]), exc_info=True)
 
-                    getattr(self, route.get("call_method"))(*params["path_args"], **params["path_kwargs"])
+                    await getattr(self, route.get("call_method"))(*params["path_args"], **params["path_kwargs"])
                     return
 
                 # This route matches the current request URI and does not have any params.
@@ -252,10 +252,9 @@ class BaseApiHandler(RequestHandler):
                 tornado.log.app_log.debug("Routing API to {}.{}()".format(self.__class__.__name__, route.get("call_method")),
                                           exc_info=True)
                 self.route = route
-                getattr(self, route.get("call_method"))()
+                await getattr(self, route.get("call_method"))()
                 return
 
-        # If we got this far, then the URI does not match any of our configured routes.
         if matched_route_with_unsupported_method:
             tornado.log.app_log.warning("Method not allowed for API route: {}".format(self.request.uri), exc_info=True)
             self.handle_method_not_allowed()
@@ -270,7 +269,7 @@ class BaseApiHandler(RequestHandler):
         :param path:
         :return:
         """
-        await IOLoop.current().run_in_executor(None, self.action_route)
+        await self.action_route()
 
     async def get(self, path):
         """
@@ -279,7 +278,7 @@ class BaseApiHandler(RequestHandler):
         :param path:
         :return:
         """
-        await IOLoop.current().run_in_executor(None, self.action_route)
+        await self.action_route()
 
     async def post(self, path):
         """
@@ -288,7 +287,7 @@ class BaseApiHandler(RequestHandler):
         :param path:
         :return:
         """
-        await IOLoop.current().run_in_executor(None, self.action_route)
+        await self.action_route()
 
     async def put(self, path):
         """
@@ -297,4 +296,4 @@ class BaseApiHandler(RequestHandler):
         :param path:
         :return:
         """
-        await IOLoop.current().run_in_executor(None, self.action_route)
+        await self.action_route()

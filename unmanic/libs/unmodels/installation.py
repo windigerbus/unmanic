@@ -49,3 +49,9 @@ class Installation(BaseModel):
     name = TextField(null=True)
     email = TextField(null=True)
     created = DateTimeField(null=True, default=datetime.datetime.now)
+
+    # Store session tokens
+    user_access_token = TextField(null=True)
+    user_refresh_token = TextField(null=True)
+    application_token = TextField(null=True)
+    session_cookies = TextField(null=True)

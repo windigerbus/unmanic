@@ -36,9 +36,12 @@ import time
 
 from unmanic import config
 from unmanic.libs import common, history
+from unmanic.libs.frontend_push_messages import FrontendPushMessages
 from unmanic.libs.library import Library
+from unmanic.libs.logs import UnmanicLogging
 from unmanic.libs.notifications import Notifications
 from unmanic.libs.plugins import PluginsHandler
+from unmanic.libs.task import TaskDataStore
 
 """
 
@@ -52,7 +55,7 @@ This prevents conflicting copy operations or deleting a file that is also being 
 
 
 class PostProcessError(Exception):
-    def __init___(self, expected_var, result_var):
+    def __init__(self, expected_var, result_var):
         Exception.__init__(self, "Errors found during post process checks. Expected {}, but instead found {}".format(
             expected_var, result_var))
         self.expected_var = expected_var
@@ -67,7 +70,7 @@ class PostProcessor(threading.Thread):
 
     def __init__(self, data_queues, task_queue, event):
         super(PostProcessor, self).__init__(name='PostProcessor')
-        self.logger = data_queues["logging"].get_logger(self.name)
+        self.logger = UnmanicLogging.get_logger(name=__class__.__name__)
         self.event = event
         self.data_queues = data_queues
         self.settings = config.Config()
@@ -97,6 +100,17 @@ class PostProcessor(threading.Thread):
                 self.event.wait(.2)
                 self.current_task = self.task_queue.get_next_processed_tasks()
                 if self.current_task:
+
+                    # Execute event plugin runners
+                    plugin_handler = PluginsHandler()
+                    plugin_handler.run_event_plugins_for_plugin_type('events.postprocessor_started', {
+                        'library_id':  self.current_task.get_task_library_id(),
+                        'task_id':     self.current_task.get_task_id(),
+                        'task_type':   self.current_task.get_task_type(),
+                        'cache_path':  self.current_task.get_cache_path(),
+                        'source_data': self.current_task.get_source_data(),
+                    })
+
                     try:
                         self._log("Post-processing task - {}".format(self.current_task.get_source_abspath()))
                     except Exception as e:
@@ -144,9 +158,9 @@ class PostProcessor(threading.Thread):
         """
         valid = True
         plugin_handler = PluginsHandler()
-        if plugin_handler.get_incompatible_enabled_plugins(self.data_queues.get('frontend_messages')):
+        if plugin_handler.get_incompatible_enabled_plugins():
             valid = False
-        if not Library.within_library_count_limits(self.data_queues.get('frontend_messages')):
+        if not Library.within_library_count_limits():
             valid = False
         return valid
 
@@ -165,7 +179,7 @@ class PostProcessor(threading.Thread):
         # Create a list for filling with destination paths
         destination_files = []
         if self.current_task.task.success:
-            # Run a postprocess file movement on the cache file for for each plugin that configures it
+            # Run a postprocess file movement on the cache file for each plugin that configures it
 
             # Fetch all 'postprocessor.file_move' plugin modules
             plugin_modules = plugin_handler.get_enabled_plugin_modules_by_type('postprocessor.file_move',
@@ -264,12 +278,16 @@ class PostProcessor(threading.Thread):
 
         for plugin_module in plugin_modules:
             data = {
-                'final_cache_path':            cache_path,
                 'library_id':                  library_id,
-                'source_data':                 source_data,
-                'task_processing_success':     self.current_task.task.success,
+                "task_id":                     self.current_task.get_task_id(),
+                "task_type":                   self.current_task.get_task_type(),
+                'final_cache_path':            cache_path,
+                'task_processing_success':     self.current_task.get_task_success(),
                 'file_move_processes_success': file_move_processes_success,
                 'destination_files':           destination_files,
+                'source_data':                 source_data,
+                'start_time':                  self.current_task.get_start_time(),
+                'finish_time':                 self.current_task.get_finish_time(),
             }
 
             # Run plugin to update data
@@ -283,7 +301,8 @@ class PostProcessor(threading.Thread):
     def post_process_remote_file(self):
         """
         Process remote files.
-        Remote files are not processed by plugins.
+        Remote files are not processed by plugins. They are just sent back to the OG installation and then the cache files are cleaned up here.
+        A remote file's source_data will be the download path where this installation initial received and stored it.
 
         TODO: Should we move remote tasks to a permanent download location within the cache path? Possibly not...
 
@@ -293,30 +312,62 @@ class PostProcessor(threading.Thread):
         cache_path = self.current_task.get_cache_path()
         source_data = self.current_task.get_source_data()
         destination_data = self.current_task.get_destination_data()
+        def_cache_path = self.settings.get_cache_path()
+
+        remove_source_file = True
+        if def_cache_path not in destination_data['abspath']:
+            remove_source_file = False
+
+        self._log(f"Cache path: {def_cache_path}", level='debug')
+        self._log(f"Remote source: {source_data['abspath']}, destination file: {destination_data['abspath']}.", level='debug')
+        self._log(f"Task cache path: {cache_path}", level='debug')
 
         # Remove the source
-        if os.path.exists(source_data.get('abspath')):
+        if os.path.exists(source_data.get('abspath')) and remove_source_file:
             self._log("Removing remote source: {}".format(source_data.get('abspath')))
             os.remove(source_data.get('abspath'))
+        elif os.path.exists(source_data.get('abspath')) and not remove_source_file:
+            self._log("Keep remote source: {}, remote file source is in library and not cache.".format(source_data.get('abspath')))
         else:
             self._log("Remote source file '{}' does not exist!".format(source_data.get('abspath')), level="warning")
 
         # Copy final cache file to original directory
-        if os.path.exists(cache_path):
+        random_string = '{}-{}'.format(common.random_string(), int(time.time()))
+        library_tdir =  os.path.join(os.path.dirname(source_data.get('abspath')), "unmanic_remote_pending_library-" + random_string)
+        cache_tdir = os.path.join(def_cache_path, "unmanic_remote_pending_library-" + random_string)
+
+        if os.path.exists(cache_path) and remove_source_file:
             self.__copy_file(cache_path, destination_data.get('abspath'), [], 'DEFAULT', move=True)
+            tdir = cache_tdir
+        elif os.path.exists(cache_path) and not remove_source_file:
+            try:
+                tdir = library_tdir
+                os.mkdir(library_tdir)
+                capture_success = self.__copy_file(cache_path, os.path.join(library_tdir, os.path.basename(cache_path)), [], 'DEFAULT', move=True)
+                if not capture_success:
+                    raise Exception("Failed to copy back to network share")
+            except:
+                 os.mkdir(cache_tdir)
+                 self.__copy_file(cache_path, os.path.join(cache_tdir, os.path.basename(cache_path)), [], 'DEFAULT', move=True)
+                 tdir = cache_tdir
         else:
             self._log("Final cache file '{}' does not exist!".format(cache_path), level="warning")
+
+        self._log(f"tdir: {tdir}", level='debug')
 
         # Cleanup cache files
         self.__cleanup_cache_files(cache_path)
 
         # Modify the task abspath - this may be different now
-        self.current_task.modify_path(destination_data.get('abspath'))
+        if remove_source_file:
+            self.current_task.modify_path(destination_data.get('abspath'))
+        else:
+            self.current_task.modify_path(os.path.join(tdir, os.path.basename(cache_path)))
 
     def __cleanup_cache_files(self, cache_path):
         """
         Remove cache files and the cache directory
-        This ensure we are not simply blindly removing a whole directory.
+        This ensures we are not simply blindly removing a whole directory.
         It ensures were are in-fact only deleting this task's cache files.
 
         :param cache_path:
@@ -413,7 +464,7 @@ class PostProcessor(threading.Thread):
             {
                 'task_label':          task_dump.get('task_label', ''),
                 'abspath':             task_dump.get('abspath', ''),
-                'task_success':        task_dump.get('task_success', ''),
+                'task_success':        task_dump.get('task_success', False),
                 'start_time':          task_dump.get('start_time', ''),
                 'finish_time':         task_dump.get('finish_time', ''),
                 'processed_by_worker': task_dump.get('processed_by_worker', ''),
@@ -421,23 +472,40 @@ class PostProcessor(threading.Thread):
             }
         )
 
+        # Execute event plugin runners
+        plugin_handler = PluginsHandler()
+        plugin_handler.run_event_plugins_for_plugin_type('events.postprocessor_complete', {
+            'library_id':          self.current_task.get_task_library_id(),
+            'task_id':             self.current_task.get_task_id(),
+            'task_type':           self.current_task.get_task_type(),
+            'source_data':         self.current_task.get_source_data(),
+            'destination_data':    self.current_task.get_destination_data(),
+            'task_success':        task_dump.get('task_success', False),
+            'start_time':          task_dump.get('start_time', ''),
+            'finish_time':         task_dump.get('finish_time', ''),
+            'processed_by_worker': task_dump.get('processed_by_worker', ''),
+            'log':                 task_dump.get('log', ''),
+        })
+
     def dump_history_log(self):
         self._log("Dumping remote task history log.", level='debug')
         task_dump = self.current_task.task_dump()
         destination_data = self.current_task.get_destination_data()
 
-        # Dump history log as metadata in the file's path
+        # Dump history log & task state as metadata in the file's path
         tasks_data_file = os.path.join(os.path.dirname(destination_data.get('abspath')), 'data.json')
+        task_state = TaskDataStore.export_task_state(self.current_task.get_task_id())
         result = common.json_dump_to_file(
             {
                 'task_label':          task_dump.get('task_label', ''),
                 'abspath':             task_dump.get('abspath', ''),
-                'task_success':        task_dump.get('task_success', ''),
+                'task_success':        task_dump.get('task_success', False),
                 'start_time':          task_dump.get('start_time', ''),
                 'finish_time':         task_dump.get('finish_time', ''),
                 'processed_by_worker': task_dump.get('processed_by_worker', ''),
                 'log':                 task_dump.get('log', ''),
                 'checksum':            'UNKNOWN',
+                'task_state':          task_state,
             }
             , tasks_data_file)
         if not result['success']:

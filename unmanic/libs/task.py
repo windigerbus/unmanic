@@ -32,14 +32,17 @@
 import json
 import os
 import shutil
+import threading
 import time
+from copy import deepcopy
 from operator import attrgetter
 
 from playhouse.shortcuts import model_to_dict
 
 from unmanic import config
-from unmanic.libs import common, unlogger
+from unmanic.libs import common
 from unmanic.libs.library import Library
+from unmanic.libs.logs import UnmanicLogging
 from unmanic.libs.unmodels.tasks import IntegrityError, Tasks
 
 
@@ -73,14 +76,9 @@ class Task(object):
         self.task = None
         self.task_dict = None
         self.settings = config.Config()
-        unmanic_logging = unlogger.UnmanicLogger.__call__()
-        self.logger = unmanic_logging.get_logger(__class__.__name__)
+        self.logger = UnmanicLogging.get_logger(name=__class__.__name__)
         self.statistics = {}
         self.errors = []
-
-    def _log(self, message, message2='', level="info"):
-        message = common.format_message(message, message2)
-        getattr(self.logger, level)(message)
 
     def set_cache_path(self, cache_directory=None, file_extension=None):
         if not self.task:
@@ -171,6 +169,21 @@ class Task(object):
     def get_source_abspath(self):
         return self.get_source_data().get('abspath')
 
+    def get_task_success(self):
+        if not self.task:
+            raise Exception('Unable to fetch task success. Task has not been set!')
+        return self.task.success
+
+    def get_start_time(self):
+        if not self.task:
+            raise Exception('Unable to fetch task start time. Task has not been set!')
+        return self.task.start_time
+
+    def get_finish_time(self):
+        if not self.task:
+            raise Exception('Unable to fetch task finish time. Task has not been set!')
+        return self.task.finish_time
+
     def task_dump(self):
         # Generate a copy of this class as a dict
         task_dict = {
@@ -199,7 +212,7 @@ class Task(object):
 
     def create_task_by_absolute_path(self, abspath, task_type='local', library_id=1, priority_score=0):
         """
-        Creates the task by it's absolute path.
+        Creates the task by its absolute path.
         If the task already exists in the list, then this will throw an exception and return false
 
         Calls to read_and_set_task_by_absolute_path() to read back all data out of the database.
@@ -213,7 +226,7 @@ class Task(object):
         try:
             self.task = Tasks.create(abspath=abspath, status='creating', library_id=library_id)
             self.save()
-            self._log("Created new task with ID: {} for {}".format(self.task, abspath), level="debug")
+            self.logger.debug("Created new task with ID: %s for %s", self.task, abspath)
 
             # Set the cache path to use during the transcoding
             self.set_cache_path()
@@ -239,7 +252,7 @@ class Task(object):
 
             return True
         except IntegrityError as e:
-            self._log("Cancel creating new task for {} - {}".format(abspath, e), level="info")
+            self.logger.info("Cancel creating new task for %s - %s", abspath, e)
             return False
 
     def set_status(self, status):
@@ -256,6 +269,8 @@ class Task(object):
             raise Exception('Unable to set status. Task has not been set!')
         self.task.status = status
         self.save()
+        if status == 'complete':
+            TaskDataStore.clear_task(self.task.id)
 
     def set_success(self, success):
         """
@@ -314,6 +329,7 @@ class Task(object):
         """
         if not self.task:
             raise Exception('Unable to save Task. Task has not been set!')
+        TaskDataStore.clear_task(self.task.id)
         self.task.delete_instance()
 
     def get_total_task_list_count(self):
@@ -350,7 +366,7 @@ class Task(object):
 
         except Tasks.DoesNotExist:
             # No task entries exist yet
-            self._log("No tasks exist yet.", level="warning")
+            self.logger.warning("No tasks exist yet.")
             query = []
 
         return query.dicts()
@@ -378,20 +394,21 @@ class Task(object):
                     if task_id.type == 'remote':
                         remote_task_dirname = task_id.abspath
                         if os.path.exists(task_id.abspath) and "unmanic_remote_pending_library" in remote_task_dirname:
-                            self._log("Removing remote pending library task '{}'.".format(remote_task_dirname))
+                            self.logger.info("Removing remote pending library task '%s'.", remote_task_dirname)
                             shutil.rmtree(os.path.dirname(remote_task_dirname))
 
+                    TaskDataStore.clear_task(task_id.id)
                     task_id.delete_instance(recursive=True)
                 except Exception as e:
                     # Catch delete exceptions
-                    self._log("An error occurred while deleting task ID: {}.".format(task_id), str(e), level="exception")
+                    self.logger.exception("An error occurred while deleting task ID: %s. %s", task_id, e)
                     return False
 
             return True
 
         except Tasks.DoesNotExist:
             # No task entries exist yet
-            self._log("No tasks currently exist.", level="warning")
+            self.logger.warning("No tasks currently exist.")
 
     def reorder_tasks(self, id_list, direction):
         # Get the task with the highest ID
@@ -426,7 +443,11 @@ class Task(object):
         :return:
         """
         query = Tasks.update(status=status).where(Tasks.id.in_(id_list))
-        return query.execute()
+        result = query.execute()
+        if status == 'complete' and id_list:
+            for task_id in id_list:
+                TaskDataStore.clear_task(task_id)
+        return result
 
     @staticmethod
     def set_tasks_library_id(id_list, library_id):
@@ -439,3 +460,267 @@ class Task(object):
         """
         query = Tasks.update(library_id=library_id).where(Tasks.id.in_(id_list))
         return query.execute()
+
+
+class TaskDataStore:
+    """
+    Thread-safe in-memory store for task lifecycle data, shared across all plugins and threads.
+
+    There are two separate stores:
+
+    1. Runner State (immutable)
+       - Stores data emitted by individual plugin runners.
+       - Once a key is set under a (task_id, plugin_id, runner), it cannot be overwritten.
+       - Structure:
+           {
+               task_id: {
+                   plugin_id: {
+                       runner_function_name: {
+                           key: value,
+                           ...
+                       },
+                       ...
+                   },
+                   ...
+               },
+               ...
+           }
+       - Example:
+           {
+               42: {
+                   "video_file_tester": {
+                       "on_worker_process": {
+                           "ffprobe": {
+                               "streams": [...],
+                               "format": {...}
+                           }
+                       }
+                   }
+               }
+           }
+
+    2. Task State (mutable)
+       - Stores arbitrary state values for a task that plugins may update freely.
+       - Structure:
+           {
+               task_id: {
+                   key: value,
+                   ...
+               },
+               ...
+           }
+       - Example:
+           {
+               42: {
+                   "progress": 0.75,
+                   "status": "running"
+               }
+           }
+    """
+
+    _runner_state = {}
+    _task_state = {}
+    _lock = threading.RLock()
+    _ctx = threading.local()
+
+    @classmethod
+    def clear_task(cls, task_id):
+        """
+        Remove all cached state for the given task ID.
+
+        :param task_id: Integer ID of the task to purge.
+        """
+        with cls._lock:
+            cls._runner_state.pop(task_id, None)
+            cls._task_state.pop(task_id, None)
+
+    @classmethod
+    def bind_runner_context(cls, task_id, plugin_id, runner):
+        """
+        Bind the current thread's runner context.
+
+        Must be called before a plugin runner executes so that
+        set_runner_value / get_runner_value know which (task_id, plugin_id, runner)
+        to use.
+
+        :param task_id: Integer ID of the task being processed.
+        :param plugin_id: String identifier of the plugin.
+        :param runner: String name of the runner function.
+        """
+        cls._ctx.task_id = task_id
+        cls._ctx.plugin_id = plugin_id
+        cls._ctx.runner = runner
+
+    @classmethod
+    def clear_context(cls):
+        """
+        Clear the current thread's runner context.
+
+        Should be called after the plugin runner completes.
+        """
+        cls._ctx.task_id = None
+        cls._ctx.plugin_id = None
+        cls._ctx.runner = None
+
+    @classmethod
+    def set_runner_value(cls, key, value):
+        """
+        Store an immutable value under the bound (task_id, plugin_id, runner).
+
+        :param key: String key to identify the data.
+        :param value: Any JSON-serializable Python object to store.
+        :return: True if stored successfully, False if that key already exists.
+        :raises RuntimeError: if no runner context is bound.
+        """
+        tid = getattr(cls._ctx, 'task_id', None)
+        pid = getattr(cls._ctx, 'plugin_id', None)
+        run = getattr(cls._ctx, 'runner', None)
+        if None in (tid, pid, run):
+            raise RuntimeError("Runner context not bound")
+        with cls._lock:
+            task_map = dict(cls._runner_state.get(tid, {}))
+            plugin_map = dict(task_map.get(pid, {}))
+            runner_map = dict(plugin_map.get(run, {}))
+            if key in runner_map:
+                return False
+            runner_map[key] = deepcopy(value)
+            plugin_map[run] = runner_map
+            task_map[pid] = plugin_map
+            cls._runner_state[tid] = task_map
+            return True
+
+    @classmethod
+    def get_runner_value(cls, key, default=None, *, plugin_id=None, runner=None):
+        """
+        Retrieve an immutable runner value by key.
+
+        :param key: String key to retrieve.
+        :param default: Value to return if key is not found.
+        :param plugin_id: (optional) override plugin identifier.
+        :param runner: (optional) override runner name.
+        :return: The stored value or default.
+        :raises RuntimeError: if context not bound and no override provided.
+        """
+        tid = getattr(cls._ctx, 'task_id', None)
+        if tid is None:
+            raise RuntimeError("Runner context not bound")
+
+        pid = plugin_id if plugin_id is not None else getattr(cls._ctx, 'plugin_id', None)
+        run = runner if runner is not None else getattr(cls._ctx, 'runner', None)
+        if None in (pid, run):
+            raise RuntimeError("Runner context not fully bound and no override provided")
+
+        with cls._lock:
+            return (
+                cls._runner_state
+                .get(tid, {})
+                .get(pid, {})
+                .get(run, {})
+                .get(key, default)
+            )
+
+    @classmethod
+    def set_task_state(cls, key, value, task_id=None):
+        """
+        Store or overwrite a mutable value for a task.
+
+        :param key: Identifier for the state.
+        :param value: JSON-serializable object.
+        :param task_id: Optional task ID; if omitted, uses bound runner context.
+        :raises: RuntimeError if no task_id provided and no context bound.
+        """
+        tid = task_id if task_id is not None else getattr(cls._ctx, 'task_id', None)
+        if tid is None:
+            raise RuntimeError("Task ID not provided or bound")
+        with cls._lock:
+            existing = cls._task_state.get(tid, {})
+            new_t = dict(existing)
+            new_t[key] = value
+            cls._task_state[tid] = new_t
+
+    @classmethod
+    def get_task_state(cls, key, default=None, task_id=None):
+        """
+        Retrieve a mutable task value by key.
+
+        :param key: Identifier to fetch.
+        :param default: Returned if key missing.
+        :param task_id: Optional task ID; if omitted, uses bound runner context.
+        :raises: RuntimeError if no task_id provided and no context bound.
+        :return: Stored value or default.
+        """
+        tid = task_id if task_id is not None else getattr(cls._ctx, 'task_id', None)
+        if tid is None:
+            raise RuntimeError("Task ID not provided or bound")
+        with cls._lock:
+            return cls._task_state.get(tid, {}).get(key, default)
+
+    @classmethod
+    def delete_task_state(cls, key, task_id=None):
+        """
+        Delete a mutable key for a given task.
+
+        :param key: Identifier to remove.
+        :param task_id: Optional task ID; if omitted, uses bound runner context.
+        :raises: RuntimeError if no task_id provided and no context bound.
+        """
+        tid = task_id if task_id is not None else getattr(cls._ctx, 'task_id', None)
+        if tid is None:
+            raise RuntimeError("Task ID not provided or bound")
+        with cls._lock:
+            t = cls._task_state.get(tid, {})
+            t.pop(key, None)
+            if not t:
+                cls._task_state.pop(tid, None)
+
+    @classmethod
+    def export_task_state(cls, task_id):
+        """
+        Export the mutable state for a specific task as a deep-copied dict.
+
+        :param task_id: Integer ID of the task to export.
+        :return: Dict of key→value for that task, or {} if none.
+        """
+        with cls._lock:
+            return deepcopy(cls._task_state.get(task_id, {}))
+
+    @classmethod
+    def export_task_state_json(cls, task_id, **json_kwargs):
+        """
+        Export the mutable state for a specific task as JSON.
+
+        :param task_id: Integer ID of the task to export.
+        :param json_kwargs: Passed to json.dumps (e.g. indent=2).
+        :return: JSON string.
+        """
+        state = cls.export_task_state(task_id)
+        return json.dumps(state, **json_kwargs)
+
+    @classmethod
+    def import_task_state(cls, task_id, new_state):
+        """
+        Merge a dict of new_state into existing task_state for a task.
+
+        Only adds or updates keys; existing keys not in new_state remain untouched.
+
+        :param task_id: Integer ID of the task.
+        :param new_state: Dict of key→value to merge in.
+        """
+        with cls._lock:
+            t = cls._task_state.setdefault(task_id, {})
+            for k, v in new_state.items():
+                t[k] = v
+
+    @classmethod
+    def import_task_state_json(cls, task_id, json_data):
+        """
+        Parse a JSON string and import it into task_state for a given task,
+        merging keys as in import_task_state.
+
+        :param task_id: Integer ID of the task.
+        :param json_data: JSON string produced by export_task_state_json.
+        """
+        parsed = json.loads(json_data)
+        if not isinstance(parsed, dict):
+            raise ValueError("Imported JSON must be an object/dict")
+        cls.import_task_state(task_id, parsed)

@@ -36,24 +36,24 @@ import queue
 import threading
 import time
 
-import psutil
 import schedule
 
 from unmanic import config
-from unmanic.libs import common, unlogger
 from unmanic.libs.filetest import FileTesterThread
+from unmanic.libs.frontend_push_messages import FrontendPushMessages
 from unmanic.libs.library import Library
+from unmanic.libs.logs import UnmanicLogging
 from unmanic.libs.plugins import PluginsHandler
 
 
 class LibraryScannerManager(threading.Thread):
     def __init__(self, data_queues, event):
         super(LibraryScannerManager, self).__init__(name='LibraryScannerManager')
+        self.logger = UnmanicLogging.get_logger(name=__class__.__name__)
         self.interval = 0
         self.firstrun = True
         self.data_queues = data_queues
         self.settings = config.Config()
-        self.logger = None
         self.event = event
         self.scheduledtasks = data_queues["scheduledtasks"]
         self.library_scanner_triggers = data_queues["library_scanner_triggers"]
@@ -64,13 +64,6 @@ class LibraryScannerManager(threading.Thread):
         self.file_test_managers = {}
         self.files_to_test = queue.Queue()
         self.files_to_process = queue.Queue()
-
-    def _log(self, message, message2='', level="info"):
-        if not self.logger:
-            unmanic_logging = unlogger.UnmanicLogger.__call__()
-            self.logger = unmanic_logging.get_logger(self.name)
-        message = common.format_message(message, message2)
-        getattr(self.logger, level)(message)
 
     def stop(self):
         self.abort_flag.set()
@@ -88,7 +81,7 @@ class LibraryScannerManager(threading.Thread):
         return False
 
     def run(self):
-        self._log("Starting LibraryScanner Monitor loop")
+        self.logger.info("Starting LibraryScanner Monitor loop")
         while not self.abort_is_set():
             self.event.wait(1)
 
@@ -96,7 +89,7 @@ class LibraryScannerManager(threading.Thread):
             if int(self.settings.get_schedule_full_scan_minutes()) != self.interval:
                 self.interval = int(self.settings.get_schedule_full_scan_minutes())
             if self.interval and self.interval != 0:
-                self._log("Setting LibraryScanner schedule to scan every {} mins...".format(self.interval))
+                self.logger.info("Setting LibraryScanner schedule to scan every %s mins...", self.interval)
                 # Configure schedule
                 self.scheduler.every(self.interval).minutes.do(self.scheduled_job)
                 # Register application
@@ -104,7 +97,7 @@ class LibraryScannerManager(threading.Thread):
 
                 # First run the task
                 if self.settings.get_run_full_scan_on_start() and self.firstrun:
-                    self._log("Running LibraryScanner on start")
+                    self.logger.info("Running LibraryScanner on start")
                     self.scheduled_job()
                 self.firstrun = False
 
@@ -123,8 +116,7 @@ class LibraryScannerManager(threading.Thread):
                     except queue.Empty:
                         continue
                     except Exception as e:
-                        self._log("Exception in retrieving library scanner trigger {}:".format(self.name), message2=str(e),
-                                  level="exception")
+                        self.logger.exception("Exception in retrieving library scanner trigger %s: %s", self.name, e)
 
                     # Check if library scanner is enabled
                     if not self.settings.get_enable_library_scanner():
@@ -137,11 +129,11 @@ class LibraryScannerManager(threading.Thread):
                     # If the settings have changed, then break this loop and clear
                     # the scheduled job resetting to the new interval
                     if int(self.settings.get_schedule_full_scan_minutes()) != self.interval:
-                        self._log("Resetting LibraryScanner schedule")
+                        self.logger.info("Resetting LibraryScanner schedule")
                         break
                 self.scheduler.clear()
 
-        self._log("Leaving LibraryScanner Monitor loop...")
+        self.logger.info("Leaving LibraryScanner Monitor loop...")
 
     def scheduled_job(self):
         """
@@ -150,7 +142,7 @@ class LibraryScannerManager(threading.Thread):
         :return:
         """
         if not self.system_configuration_is_valid():
-            self._log("Skipping library scanner due invalid system configuration.", level='warning')
+            self.logger.warning("Skipping library scanner due invalid system configuration.")
             return
 
         # For each configured library, check if a library scan is required
@@ -160,7 +152,7 @@ class LibraryScannerManager(threading.Thread):
             try:
                 library = Library(lib_info['id'])
             except Exception as e:
-                self._log("Unable to fetch library config for ID {}".format(lib_info['id']), level='exception')
+                self.logger.exception("Unable to fetch library config for ID %s", lib_info['id'])
                 continue
             # Check if the library is configured for remote files only
             if library.get_enable_remote_only():
@@ -169,10 +161,11 @@ class LibraryScannerManager(threading.Thread):
             # Check if library scanner is enabled on any library
             if library.get_enable_scanner():
                 # Run library scan
-                self._log("Running full library scan on library '{}'".format(library.get_name()))
-                self.scan_library_path(library.get_path(), library.get_id())
+                library_name = library.get_name()
+                self.logger.info("Running full library scan on library '%s'", library_name)
+                self.scan_library_path(library_name, library.get_path(), library.get_id())
         if no_libraries_configured:
-            self._log("No libraries are configured to run a library scan")
+            self.logger.info("No libraries are configured to run a library scan")
 
     def system_configuration_is_valid(self):
         """
@@ -182,9 +175,9 @@ class LibraryScannerManager(threading.Thread):
         """
         valid = True
         plugin_handler = PluginsHandler()
-        if plugin_handler.get_incompatible_enabled_plugins(self.data_queues.get('frontend_messages')):
+        if plugin_handler.get_incompatible_enabled_plugins():
             valid = False
-        if not Library.within_library_count_limits(self.data_queues.get('frontend_messages')):
+        if not Library.within_library_count_limits():
             valid = False
         return valid
 
@@ -206,22 +199,23 @@ class LibraryScannerManager(threading.Thread):
         for manager_id in self.file_test_managers:
             self.file_test_managers[manager_id].abort_flag.set()
 
-    def scan_library_path(self, library_path, library_id):
+    def scan_library_path(self, library_name, library_path, library_id):
         """
         Run a scan of the given library path
 
+        :param library_name:
         :param library_path:
         :param library_id:
         :return:
         """
         if not os.path.exists(library_path):
-            self._log("Path does not exist - '{}'".format(library_path), level="warning")
+            self.logger.warning("Path does not exist - '%s'", library_path)
             return
         if self.settings.get_debugging():
-            self._log("Scanning directory - '{}'".format(library_path), level="debug")
+            self.logger.debug("Scanning directory - '%s'", library_path)
 
         # Push status notification to frontend
-        frontend_messages = self.data_queues.get('frontend_messages')
+        frontend_messages = FrontendPushMessages()
 
         # Start X number of FileTesterThread threads
         concurrent_file_testers = self.settings.get_concurrent_file_testers()
@@ -230,7 +224,7 @@ class LibraryScannerManager(threading.Thread):
         for results_manager_id in range(int(concurrent_file_testers)):
             self.start_results_manager_thread(results_manager_id, status_updates, library_id)
 
-        start_time = time.time()
+        scan_start_time = time.time()
 
         frontend_messages.update(
             {
@@ -250,7 +244,7 @@ class LibraryScannerManager(threading.Thread):
             if self.abort_flag.is_set():
                 break
             if self.settings.get_debugging():
-                self._log(json.dumps(files, indent=2), level="debug")
+                self.logger.debug(json.dumps(files, indent=2))
             # Add all files in this path that match our container filter
             for file_path in files:
                 if self.abort_flag.is_set():
@@ -326,7 +320,38 @@ class LibraryScannerManager(threading.Thread):
             self.file_test_managers[manager_id].abort_flag.set()
             self.file_test_managers[manager_id].join(2)
 
-        self._log("Library scan completed in {} seconds".format((time.time() - start_time)), level="warning")
+        scan_end_time = time.time()
+        scan_duration = str((scan_end_time - scan_start_time))
+        self.logger.warning("Library scan completed in %s seconds", scan_duration)
+        UnmanicLogging.metric("library_scan_completed",
+                              library_name=library_name,
+                              library_path=library_path,
+                              library_id=library_id,
+                              scan_start_time=scan_start_time,
+                              scan_end_time=scan_end_time,
+                              scan_duration=scan_duration)
+        UnmanicLogging.data("last_library_scan",
+                            data_search_key=library_id,  # Key this metric by the library_id
+                            library_name=library_name,
+                            library_path=library_path,
+                            library_id=library_id,
+                            scan_start_time=scan_start_time,
+                            scan_end_time=scan_end_time,
+                            scan_duration=scan_duration,
+                            files_scanned_count=total_file_count)
+
+        # Execute event plugin runners
+        data = {
+            "library_id":          library_id,
+            "library_name":        library_name,
+            "library_path":        library_path,
+            "scan_start_time":     scan_start_time,
+            "scan_end_time":       scan_end_time,
+            "scan_duration":       scan_duration,
+            "files_scanned_count": total_file_count,
+        }
+        plugin_handler = PluginsHandler()
+        plugin_handler.run_event_plugins_for_plugin_type('events.scan_complete', data)
 
         # Run a manual garbage collection
         gc.collect()

@@ -29,18 +29,23 @@
            OR OTHER DEALINGS IN THE SOFTWARE.
 
 """
+import base64
 import hashlib
 import json
 import os
 import shutil
+import subprocess
+import sys
 import zipfile
 from operator import attrgetter
 
 import requests
 
 from unmanic import config
-from unmanic.libs import common, unlogger
+from unmanic.libs import common
+from unmanic.libs.frontend_push_messages import FrontendPushMessages
 from unmanic.libs.library import Library
+from unmanic.libs.logs import UnmanicLogging
 from unmanic.libs.session import Session
 from unmanic.libs.singleton import SingletonType
 from unmanic.libs.unmodels import EnabledPlugins, LibraryPluginFlow, Plugins, PluginRepos
@@ -54,15 +59,9 @@ class PluginsHandler(object, metaclass=SingletonType):
     """
     version: int = 2
 
-    """
-    Set the default repo to main repo
-    """
-    default_repo = 'https://api.unmanic.app/api/v1/unmanic-plugin-repo/uuid'
-
     def __init__(self, *args, **kwargs):
         self.settings = config.Config()
-        unmanic_logging = unlogger.UnmanicLogger.__call__()
-        self.logger = unmanic_logging.get_logger(__class__.__name__)
+        self.logger = UnmanicLogging.get_logger(name=__class__.__name__)
 
     def _log(self, message, message2='', level="info"):
         message = common.format_message(message, message2)
@@ -88,8 +87,9 @@ class PluginsHandler(object, metaclass=SingletonType):
         plugin_directory = self.settings.get_plugins_path()
         return os.path.join(plugin_directory, "{}-{}.zip".format(plugin_id, plugin_version))
 
-    def get_default_repo(self):
-        return self.default_repo
+    @staticmethod
+    def get_default_repo():
+        return "default"
 
     def get_plugin_repos(self):
         """
@@ -97,19 +97,17 @@ class PluginsHandler(object, metaclass=SingletonType):
 
         :return:
         """
-        session = Session()
-        uuid = session.get_installation_uuid()
         default_repo = self.get_default_repo()
         repo_list = [
             {
-                "path": "{}/{}".format(default_repo, uuid)
+                "path": default_repo
             }
         ]
 
         repos = PluginRepos.select().order_by(PluginRepos.id.asc())
         for repo in repos:
             repo_dict = repo.model_to_dict()
-            if repo_dict.get('path') == "{}/{}".format(default_repo, uuid):
+            if repo_dict.get('path') == default_repo:
                 continue
             repo_list.append(repo_dict)
 
@@ -138,11 +136,26 @@ class PluginsHandler(object, metaclass=SingletonType):
         # Fetch remote JSON file
         session = Session()
         uuid = session.get_installation_uuid()
-        post_data = {
-            "uuid":     uuid,
-            "repo_url": repo_path
-        }
-        return session.api_post(1, 'unmanic-plugin-repo/uuid/{}'.format(uuid), post_data)
+        level = session.get_supporter_level()
+        repo = base64.b64encode(repo_path.encode('utf-8')).decode('utf-8')
+        api_path = f'plugin_repos/get_repo_data/uuid/{uuid}/level/{level}/repo/{repo}'
+        data, status_code = session.api_get(
+            'unmanic-api',
+            1,
+            api_path,
+        )
+        if status_code == 401:
+            # Something is wrong with registration. Let's resend it and try again.
+            self.logger.debug(f"Plugin repo returned a request to register. Code:{status_code}")
+            session.register_unmanic()
+            data, status_code = session.api_get(
+                'unmanic-api',
+                1,
+                api_path,
+            )
+        if status_code >= 500:
+            self.logger.debug(f"Failed to fetch plugin repo from '{api_path}'. Code:{status_code}")
+        return data
 
     def update_plugin_repos(self):
         """
@@ -163,13 +176,12 @@ class PluginsHandler(object, metaclass=SingletonType):
 
             # Dumb object to local JSON file
             repo_cache = self.get_repo_cache_file(repo_id)
-            self._log("Repo cache file '{}'.".format(repo_cache), level="info")
+            self.logger.info("Repo cache file '%s'.", repo_cache)
             try:
                 with open(repo_cache, 'w') as f:
                     json.dump(repo_data, f, indent=4)
             except json.JSONDecodeError as e:
-                self._log("Unable to update plugin repo '{}'.".format(repo_path), str(e), level="error")
-
+                self.logger.error("Unable to update plugin repo '%s'. %s", repo_path, str(e))
         return True
 
     def get_settings_of_all_installed_plugins(self):
@@ -307,7 +319,7 @@ class PluginsHandler(object, metaclass=SingletonType):
 
     def notify_site_of_plugin_install(self, plugin):
         """
-        Notify the unmanic.app site API of the install.
+        Notify the unmanic.app site API of the installation.
         This is used for metric stats so that we can get a count of plugin downloads.
 
         :param plugin:
@@ -316,18 +328,20 @@ class PluginsHandler(object, metaclass=SingletonType):
         # Post
         session = Session()
         uuid = session.get_installation_uuid()
+        level = session.get_supporter_level()
         post_data = {
             "uuid":      uuid,
+            "level":     level,
             "plugin_id": plugin.get("plugin_id"),
             "author":    plugin.get("author"),
             "version":   plugin.get("version"),
         }
         try:
-            repo_data = session.api_post(1, 'unmanic-plugin/install', post_data)
+            repo_data, status_code = session.api_post('unmanic-api', 1, 'plugin_repos/record_install', post_data)
             if not repo_data.get('success'):
                 session.register_unmanic()
         except Exception as e:
-            self._log("Exception while logging plugin install.", str(e), level="debug")
+            self.logger.debug("Exception while logging plugin install. %s", str(e))
             return False
 
     def install_plugin_by_id(self, plugin_id, repo_id=None):
@@ -351,7 +365,7 @@ class PluginsHandler(object, metaclass=SingletonType):
                         plugin_directory = self.get_plugin_path(plugin.get("plugin_id"))
                         result = self.write_plugin_data_to_db(plugin, plugin_directory)
                         if result:
-                            self._log("Installed plugin '{}'".format(plugin_id), level="info")
+                            self.logger.info("Installed plugin '%s'", plugin_id)
 
                         # Ensure the plugin module is reloaded (if it was previously loaded)
                         plugin_executor = PluginExecutor()
@@ -359,7 +373,7 @@ class PluginsHandler(object, metaclass=SingletonType):
 
                         return result
                     except Exception as e:
-                        self._log("Exception while installing plugin '{}'.".format(plugin), str(e), level="exception")
+                        self.logger.exception("Exception while installing plugin '%s'.", plugin)
 
         return False
 
@@ -386,7 +400,7 @@ class PluginsHandler(object, metaclass=SingletonType):
             plugin_directory = self.get_plugin_path(plugin_info.get("plugin_id"))
             result = self.write_plugin_data_to_db(plugin_info, plugin_directory)
             if result:
-                self._log("Installed plugin '{}'".format(plugin_info.get("plugin_id")), level="info")
+                self.logger.info("Installed plugin '%s'", plugin_info.get("plugin_id"))
 
             # Ensure the plugin module is reloaded (if it was previously loaded)
             plugin_executor = PluginExecutor()
@@ -394,7 +408,7 @@ class PluginsHandler(object, metaclass=SingletonType):
 
             return result
         except Exception as e:
-            self._log("Exception while installing plugin from zip '{}'.".format(abspath), str(e), level="exception")
+            self.logger.exception("Exception while installing plugin from zip '%s'. %s", abspath, str(e))
 
         return False
 
@@ -405,7 +419,7 @@ class PluginsHandler(object, metaclass=SingletonType):
         :param plugin:
         :return:
         """
-        self._log("Installing plugin '{}'".format(plugin.get("name")), level='debug')
+        self.logger.debug("Installing plugin '%s'", plugin.get("name"))
         # Try to fetch URL
         try:
             # Fetch remote zip file
@@ -423,8 +437,7 @@ class PluginsHandler(object, metaclass=SingletonType):
             return True
 
         except Exception as e:
-            success = False
-            self._log("Exception while installing plugin '{}'.".format(plugin), str(e), level="exception")
+            self.logger.exception("Exception while installing plugin '%s'. %s", plugin, str(e))
 
         return False
 
@@ -437,7 +450,7 @@ class PluginsHandler(object, metaclass=SingletonType):
         """
         # Fetch remote zip file
         destination = self.get_plugin_download_cache_path(plugin.get("plugin_id"), plugin.get("version"))
-        self._log("Downloading plugin '{}' to '{}'".format(plugin.get("package_url"), destination), level='debug')
+        self.logger.debug("Downloading plugin '%s' to '%s'", plugin.get("package_url"), destination)
         with requests.get(plugin.get("package_url"), stream=True, allow_redirects=True) as r:
             r.raise_for_status()
             with open(destination, 'wb') as f:
@@ -460,12 +473,52 @@ class PluginsHandler(object, metaclass=SingletonType):
             plugin_id = plugin_info.get('id')
         # Create plugin destination directory based on plugin ID
         plugin_directory = self.get_plugin_path(plugin_id)
+        # Prevent installation if destination has a git repository. This plugin is probably under development
+        self.logger.info(os.path.join(str(plugin_directory), '.git'))
+        if os.path.exists(os.path.join(str(plugin_directory), '.git')):
+            raise Exception("Plugin directory contains a git repository. Uninstall this source version before installing.")
         # Extract zip file contents
-        self._log("Extracting plugin to '{}'".format(plugin_directory), level='debug')
+        self.logger.debug("Extracting plugin to '{}'".format(plugin_directory))
         with zipfile.ZipFile(zip_file, "r") as zip_ref:
-            zip_ref.extractall(plugin_directory)
+            zip_ref.extractall(str(plugin_directory))
+        # Read plugin info
+        plugin_info = self.get_plugin_info(plugin_id)
+        # Run through any required dependency installation
+        post_install_python_requirements = os.path.join(str(plugin_directory), 'requirements.post-install.txt')
+        if os.path.exists(post_install_python_requirements):
+            self.install_plugin_requirements(plugin_directory, requirements_file=post_install_python_requirements)
+        if plugin_info.get('defer_dependency_install', False):
+            self.install_plugin_requirements(plugin_directory)
+            self.install_npm_modules(plugin_directory)
         # Return installed plugin info
-        return self.get_plugin_info(plugin_id)
+        return plugin_info
+
+    @staticmethod
+    def install_plugin_requirements(plugin_path, requirements_file=None):
+        if requirements_file is None:
+            requirements_file = os.path.join(plugin_path, 'requirements.txt')
+        install_target = os.path.join(plugin_path, 'site-packages')
+        # Check if the requirements file exists
+        if not os.path.exists(requirements_file):
+            return
+        # First, remove the existing site-packages directory if it exists to ensure a clean installation
+        if os.path.exists(install_target):
+            shutil.rmtree(install_target)
+        # Recreate the site-packages directory
+        os.makedirs(install_target, exist_ok=True)
+        subprocess.call([
+            sys.executable, '-m', 'pip', 'install', '--upgrade',
+            '-r', requirements_file,
+            '--target={}'.format(install_target)
+        ])
+
+    @staticmethod
+    def install_npm_modules(plugin_path):
+        package_file = os.path.join(plugin_path, 'package.json')
+        if not os.path.exists(package_file):
+            return
+        subprocess.call(['npm', 'install'], cwd=plugin_path)
+        subprocess.call(['npm', 'run', 'build'], cwd=plugin_path)
 
     @staticmethod
     def write_plugin_data_to_db(plugin, plugin_directory):
@@ -554,10 +607,10 @@ class PluginsHandler(object, metaclass=SingletonType):
 
         except Plugins.DoesNotExist:
             # No plugin entries exist yet
-            self._log("No plugins exist yet.", level="warning")
+            self.logger.warning("No plugins exist yet.")
 
     def flag_plugin_for_update_by_id(self, plugin_id):
-        self._log("Flagging update available for installed plugin '{}'".format(plugin_id), level='debug')
+        self.logger.debug("Flagging update available for installed plugin '%s'", plugin_id)
         # Disable the matching entries in the table
         Plugins.update(update_available=True).where(Plugins.plugin_id == plugin_id).execute()
 
@@ -568,7 +621,7 @@ class PluginsHandler(object, metaclass=SingletonType):
         for record in records:
             if record.get('update_available'):
                 continue
-            self._log("Failed to flag plugin for update '{}'".format(record.get('plugin_id')), level='debug')
+            self.logger.debug("Failed to flag plugin for update '%s'", record.get('plugin_id'))
             return False
 
         return True
@@ -581,7 +634,7 @@ class PluginsHandler(object, metaclass=SingletonType):
         :param plugin_table_ids:
         :return:
         """
-        self._log("Uninstall plugins '{}'".format(plugin_table_ids), level='debug')
+        self.logger.debug("Uninstall plugins '%s'", plugin_table_ids)
 
         # Fetch records
         records_by_id = self.get_plugin_list_filtered_and_sorted(id_list=plugin_table_ids)
@@ -620,7 +673,7 @@ class PluginsHandler(object, metaclass=SingletonType):
         return True
 
     def update_plugins_by_db_table_id(self, plugin_table_ids):
-        self._log("Update plugins '{}'".format(plugin_table_ids), level='debug')
+        self.logger.debug("Update plugins '%s'", plugin_table_ids)
 
         # Fetch records
         records_by_id = self.get_plugin_list_filtered_and_sorted(id_list=plugin_table_ids)
@@ -629,7 +682,7 @@ class PluginsHandler(object, metaclass=SingletonType):
         for record in records_by_id:
             if self.install_plugin_by_id(record.get('plugin_id')):
                 continue
-            self._log("Failed to update plugin '{}'".format(record.get('plugin_id')), level='debug')
+            self.logger.debug("Failed to update plugin '%s'", record.get('plugin_id'))
             return False
 
         return True
@@ -746,19 +799,20 @@ class PluginsHandler(object, metaclass=SingletonType):
         """
         Ensure that the currently installed plugins are compatible with this PluginsHandler version
 
-        :param frontend_messages:
         :return:
         :rtype:
         """
+        if frontend_messages is None:
+            frontend_messages = FrontendPushMessages()
         # Fetch all libraries
         all_libraries = Library.get_all_libraries()
 
         def add_frontend_message(plugin_id, name):
             # If the frontend messages queue was included in request, append a message
             if frontend_messages:
-                frontend_messages.put(
+                frontend_messages.add(
                     {
-                        'id':      'incompatiblePlugin_{}'.format(plugin_id),
+                        'id':      f'incompatiblePlugin_{plugin_id}',
                         'type':    'error',
                         'code':    'incompatiblePlugin',
                         'message': name,
@@ -834,3 +888,16 @@ class PluginsHandler(object, metaclass=SingletonType):
                 }
             )
         return return_plugin_flow
+
+    def run_event_plugins_for_plugin_type(self, plugin_type, data):
+        """
+        Run all enabled plugins for an event plugin type
+
+        :param plugin_type:
+        :param data:
+        :return:
+        """
+        plugin_modules = self.get_enabled_plugin_modules_by_type(plugin_type)
+        for plugin_module in plugin_modules:
+            if not self.exec_plugin_runner(data, plugin_module.get('plugin_id'), plugin_type):
+                continue

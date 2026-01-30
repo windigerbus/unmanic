@@ -34,14 +34,16 @@ import os
 import json
 
 from unmanic import metadata
-from unmanic.libs import unlogger
 from unmanic.libs import common
+from unmanic.libs.logs import UnmanicLogging
 from unmanic.libs.singleton import SingletonType
 
 try:
     from json.decoder import JSONDecodeError
 except ImportError:
     JSONDecodeError = ValueError
+
+logger = UnmanicLogging.get_logger(name="Config")
 
 
 class Config(object, metaclass=SingletonType):
@@ -54,13 +56,17 @@ class Config(object, metaclass=SingletonType):
         self.ui_port = 8888
 
         # Set default directories
-        self.config_path = os.path.join(common.get_home_dir(), '.unmanic', 'config')
-        self.log_path = os.path.join(common.get_home_dir(), '.unmanic', 'logs')
-        self.plugins_path = os.path.join(common.get_home_dir(), '.unmanic', 'plugins')
-        self.userdata_path = os.path.join(common.get_home_dir(), '.unmanic', 'userdata')
+        home_directory = common.get_home_dir()
+        self.config_path = os.path.join(home_directory, '.unmanic', 'config')
+        self.log_path = os.path.join(home_directory, '.unmanic', 'logs')
+        self.plugins_path = os.path.join(home_directory, '.unmanic', 'plugins')
+        self.userdata_path = os.path.join(home_directory, '.unmanic', 'userdata')
 
         # Configure debugging
         self.debugging = False
+
+        # Configure log buffer retention (in days)
+        self.log_buffer_retention = 0
 
         # Configure first run (future feature)
         self.first_run = False
@@ -116,23 +122,6 @@ class Config(object, metaclass=SingletonType):
         # Apply settings to the unmanic logger
         self.__setup_unmanic_logger()
 
-    def _log(self, message, message2='', level="info"):
-        """
-        Generic logging method. Can be implemented on any unmanic class
-
-        :param message:
-        :param message2:
-        :param level:
-        :return:
-        """
-        unmanic_logging = unlogger.UnmanicLogger.__call__()
-        logger = unmanic_logging.get_logger(__class__.__name__)
-        if logger:
-            message = common.format_message(message, message2)
-            getattr(logger, level)(message)
-        else:
-            print("Unmanic.{} - ERROR!!! Failed to find logger".format(self.__name__))
-
     def get_config_as_dict(self):
         """
         Return a dictionary of configuration fields and their current values
@@ -155,8 +144,7 @@ class Config(object, metaclass=SingletonType):
 
         :return:
         """
-        unmanic_logging = unlogger.UnmanicLogger.__call__()
-        unmanic_logging.setup_logger(self)
+        UnmanicLogging.get_logger(settings=self)
 
     def __import_settings_from_env(self):
         """
@@ -188,7 +176,7 @@ class Config(object, metaclass=SingletonType):
                 with open(settings_file) as infile:
                     data = json.load(infile)
             except Exception as e:
-                self._log("Exception in reading saved settings from file:", message2=str(e), level="exception")
+                logger.exception("Exception in reading saved settings from file: %s", e)
             # Set data to Config class
             self.set_bulk_config_items(data, save_settings=False)
 
@@ -205,7 +193,7 @@ class Config(object, metaclass=SingletonType):
         result = common.json_dump_to_file(data, settings_file)
         if not result['success']:
             for message in result['errors']:
-                self._log("Error:", message2=str(message), level="error")
+                logger.error(message)
             raise Exception("Exception in writing settings to file")
 
     def get_config_item(self, key):
@@ -238,7 +226,7 @@ class Config(object, metaclass=SingletonType):
         field_id = key.lower()
         # Check if key is a valid setting
         if field_id not in self.get_config_keys():
-            self._log("Attempting to save unknown key", message2=str(key), level="warning")
+            logger.warning("Attempting to save unknown key: %s", key)
             # Do not proceed if this is any key other than the database
             return
 
@@ -256,7 +244,7 @@ class Config(object, metaclass=SingletonType):
             try:
                 self.__write_settings_to_file()
             except Exception as e:
-                self._log("Failed to write settings to file: ", message2=str(self.get_config_as_dict()), level="exception")
+                logger.exception("Failed to write settings to file: %s", str(self.get_config_as_dict()))
 
     def set_bulk_config_items(self, items, save_settings=True):
         """
@@ -322,7 +310,7 @@ class Config(object, metaclass=SingletonType):
         :return:
         """
         if cache_path == "":
-            self._log("Cache path cannot be empty. Resetting it to default", level="warning")
+            logger.warning("Cache path cannot be empty. Resetting it to default.")
             cache_path = common.get_default_cache_path()
         self.cache_path = cache_path
 
@@ -350,12 +338,38 @@ class Config(object, metaclass=SingletonType):
 
         :return:
         """
-        unmanic_logging = unlogger.UnmanicLogger.__call__()
         if value:
-            unmanic_logging.enable_debugging()
+            UnmanicLogging.enable_debugging()
         else:
-            unmanic_logging.disable_debugging()
+            UnmanicLogging.disable_debugging()
         self.debugging = value
+
+    def get_log_buffer_retention(self):
+        """
+        Get setting - log_buffer_retention
+
+        :return:
+        """
+        return self.log_buffer_retention
+
+    def set_log_buffer_retention(self, value):
+        """
+        Set setting - log_buffer_retention
+
+        This requires an update to the logger object
+
+        :return:
+        """
+        try:
+            retention_days = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"log_buffer_retention must be an integer, got {value!r}")
+        try:
+            # On Unmanic startup, it may not have yet initialised the logger when this is first run.
+            UnmanicLogging.set_remote_logging_retention(retention_days)
+        except (AttributeError):
+            pass
+        self.log_buffer_retention = retention_days
 
     def get_first_run(self):
         """

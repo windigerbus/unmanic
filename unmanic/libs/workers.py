@@ -29,9 +29,9 @@
            OR OTHER DEALINGS IN THE SOFTWARE.
 
 """
-import hashlib
 import os
 import queue
+import shlex
 import shutil
 import subprocess
 import threading
@@ -39,20 +39,340 @@ import time
 
 import psutil
 
-from unmanic.libs import common, unlogger
+from unmanic.libs import common
+from unmanic.libs.logs import UnmanicLogging
 from unmanic.libs.plugins import PluginsHandler
 
 
-def default_progress_parser(line_text):
-    return {
-        'percent': ''
-    }
-
-
 class WorkerCommandError(Exception):
-    def __init___(self, command):
+    def __init__(self, command):
         Exception.__init__(self, "Worker command returned non 0 status. Command: {}".format(command))
         self.command = command
+
+
+class WorkerSubprocessMonitor(threading.Thread):
+    def __init__(self, parent_worker):
+        super().__init__(daemon=True)
+        self.logger = UnmanicLogging.get_logger(name=__class__.__name__)
+        self._stop_event = threading.Event()
+        self._terminate_lock = threading.Lock()
+
+        self.parent_worker = parent_worker
+        self.event = parent_worker.event
+        self.redundant_flag = parent_worker.redundant_flag
+        self.paused_flag = parent_worker.paused_flag
+        self.paused = False
+
+        # Set current subprocess to None
+        self.subprocess_pid = None
+        self.subprocess = None
+        self.subprocess_start_time = 0
+        self.subprocess_pause_time = 0
+
+        # Subprocess stats
+        self.subprocess_percent = 0
+        self.subprocess_elapsed = 0
+        self.subprocess_cpu_percent = 0
+        self.subprocess_mem_percent = 0
+        self.subprocess_rss_bytes = 0
+        self.subprocess_vms_bytes = 0
+
+    def set_proc(self, pid):
+        try:
+            if pid != self.subprocess_pid:
+                self.subprocess_pid = pid
+                self.subprocess = psutil.Process(pid=pid)
+                # Reset pause time
+                self.subprocess_start_time = time.time()
+                self.subprocess_pause_time = 0
+                # Reset subprocess progress
+                self.subprocess_percent = 0
+                self.subprocess_elapsed = 0
+            if self.redundant_flag.is_set():
+                # If the redundant flag is set then we should terminate any set procs straight away as the worker needs to stop
+                self.logger.debug("A new subprocess was spawned, but the worker is trying to terminate. Subprocess PID %s",
+                                  self.subprocess_pid)
+                self.terminate_proc()
+
+        except Exception:
+            self.logger.exception("Exception in set_proc()")
+
+    def unset_proc(self):
+        try:
+            self.subprocess_pid = None
+            self.subprocess = None
+            # Reset subprocess progress
+            self.subprocess_percent = 0
+            self.subprocess_elapsed = 0
+            # Reset resource values
+            self.set_proc_resources_in_parent_worker(0, 0, 0, 0)
+        except Exception:
+            self.logger.exception("Exception in unset_proc()")
+
+    def set_proc_resources_in_parent_worker(self, normalised_cpu_percent, rss_bytes, vms_bytes, mem_percent):
+        self.subprocess_cpu_percent = normalised_cpu_percent
+        self.subprocess_rss_bytes = rss_bytes
+        self.subprocess_vms_bytes = vms_bytes
+        self.subprocess_mem_percent = mem_percent
+
+    def suspend_proc(self):
+        # Stop the process if the worker is paused
+        # Then resume it when the worker is resumed
+        try:
+            if not self.subprocess or not self.subprocess.is_running():
+                return
+
+            # Create list of all subprocesses - parent + all children
+            procs = [self.subprocess] + self.subprocess.children(recursive=True)
+
+            # Suspend them all
+            for p in procs:
+                try:
+                    self.logger.debug("Pausing PID %s", p.pid)
+                    p.suspend()
+                except psutil.NoSuchProcess:
+                    continue
+
+            self.paused = True
+            pause_time_counter = time.time()
+
+            while not self.redundant_flag.is_set():
+                self.event.wait(1)
+
+                # Update pause duration on each loop
+                self.subprocess_pause_time += int(time.time() - pause_time_counter)
+                pause_time_counter = time.time()
+
+                if not self.paused_flag.is_set():
+                    # Resume in reverse order
+                    for p in reversed(procs):
+                        try:
+                            self.logger.debug("Resuming PID %s", p.pid)
+                            p.resume()
+                            # Force anything to shut down straight away if we are exiting the thread
+                            if self.redundant_flag.is_set() or self._stop_event.is_set():
+                                p.terminate()
+                        except psutil.NoSuchProcess:
+                            continue
+                    self.paused = False
+                    break
+
+        except Exception:
+            self.logger.exception("Exception in suspend_proc()")
+
+    def terminate_proc(self):
+        with self._terminate_lock:
+            try:
+                # If the process is still running, kill it
+                if self.subprocess is not None:
+                    self.logger.info("Terminating subprocess PID: %s", self.subprocess_pid)
+                    self.__terminate_proc_tree(self.subprocess)
+                    self.logger.info("Subprocess terminated")
+                    self.unset_proc()
+            except Exception:
+                self.logger.exception("Exception in terminate_proc()")
+
+    def __log_proc_terminated(self, proc: psutil.Process):
+        try:
+            self.logger.info("Process %s terminated with exit code %s", proc, proc.returncode)
+        except Exception:
+            self.logger.exception("Exception in __log_proc_terminated()")
+
+    def __terminate_proc_tree(self, proc: psutil.Process):
+        """
+        Terminate the process tree (including grandchildren).
+        Ensures any suspended processes are first resumed so that
+        terminate() will actually take effect.  Processes that
+        fail to stop with terminate() within 3s will be killed.
+
+        :param proc:
+        :return:
+        """
+        try:
+            # Build the full tree
+            all_procs = proc.children(recursive=True) + [proc]
+
+            # Resume all suspended processes so they can handle signals
+            for p in all_procs:
+                try:
+                    p.resume()
+                except (psutil.NoSuchProcess, NotImplementedError):
+                    pass
+
+            # Attempt graceful shutdown
+            for p in all_procs:
+                try:
+                    p.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+
+            # Wait up to 3s for them to exit
+            gone, alive = psutil.wait_procs(all_procs, timeout=3, callback=self.__log_proc_terminated)
+
+            # Force-kill any remaining processes
+            for p in alive:
+                try:
+                    p.kill()
+                except psutil.NoSuchProcess:
+                    pass
+
+            # Final wait to reap
+            psutil.wait_procs(alive, timeout=3, callback=self.__log_proc_terminated)
+
+        except Exception:
+            self.logger.exception("Exception in __terminate_proc_tree()")
+
+    def get_subprocess_elapsed(self):
+        try:
+            subprocess_elapsed = 0
+            if self.subprocess is not None:
+                # Get the time now
+                now = int(time.time())
+                # Get the total running time (including time being paused)
+                total_run_time = int(now - self.subprocess_start_time)
+                # Get the time when we started being paused
+                # Calculate elapsed time of the subprocess subtracting the pause duration
+                subprocess_elapsed = int(total_run_time - self.subprocess_pause_time)
+            return subprocess_elapsed
+        except Exception:
+            self.logger.exception("Exception in get_subprocess_elapsed()")
+            return 0
+
+    def get_subprocess_stats(self):
+        try:
+            return {
+                'pid':         str(self.subprocess_pid),
+                'percent':     str(self.subprocess_percent),
+                'elapsed':     self.get_subprocess_elapsed(),
+                'cpu_percent': str(self.subprocess_cpu_percent),
+                'mem_percent': str(self.subprocess_mem_percent),
+                'rss_bytes':   str(self.subprocess_rss_bytes),
+                'vms_bytes':   str(self.subprocess_vms_bytes),
+            }
+        except Exception:
+            self.logger.exception("Exception in get_subprocess_stats()")
+            # Return something minimal so UI won't break
+            return {
+                'pid':         '0', 'percent': '0', 'elapsed': '0',
+                'cpu_percent': '0', 'mem_percent': '0',
+                'rss_bytes':   '0', 'vms_bytes': '0',
+            }
+
+    def set_subprocess_start_time(self, proc_start_time):
+        try:
+            self.subprocess_start_time = proc_start_time
+        except Exception:
+            self.logger.exception("Exception in set_subprocess_start_time()")
+
+    def set_subprocess_percent(self, percent):
+        try:
+            self.subprocess_percent = percent
+        except Exception:
+            self.logger.exception("Exception in set_subprocess_percent()")
+
+    def default_progress_parser(self, line_text, pid=None, proc_start_time=None, unset=False):
+        if unset:
+            # Here we provide a plugin with the ability to unset a subprocess (indicating that it completed)
+            self.unset_proc()
+            return {
+                'killed':  self.redundant_flag.is_set(),
+                'paused':  self.paused,
+                'percent': str(self.subprocess_percent),
+            }
+        try:
+            if pid is not None:
+                self.set_proc(pid)
+            if proc_start_time is not None:
+                self.set_subprocess_start_time(proc_start_time)
+            try:
+                stripped_text = str(line_text).strip()
+                text_float = float(stripped_text)
+                self.subprocess_percent = int(text_float)
+            except (TypeError, ValueError):
+                pass
+            return {
+                'killed':  self.redundant_flag.is_set(),
+                'paused':  self.paused,
+                'percent': str(self.subprocess_percent),
+            }
+        except Exception:
+            self.logger.exception("Exception in default_progress_parser()")
+            return {
+                'killed':  self.redundant_flag.is_set(),
+                'paused':  self.paused,
+                'percent': str(self.subprocess_percent),
+            }
+
+    def run(self):
+        # First fetch the number of CPUs for normalising the CPU percent
+        cpu_count = psutil.cpu_count(logical=True)
+        # Loop while thread is expected to be running
+        self.logger.warning("Starting WorkerMonitor loop")
+        while True:
+            try:
+                if self._stop_event.is_set():
+                    self.event.wait(1)
+                    break
+
+                if self.redundant_flag.is_set():
+                    # If the worker needs to exit, then terminate the subprocess
+                    self.terminate_proc()
+                    self.event.wait(1)
+                    continue
+
+                if self.subprocess is None:
+                    self.event.wait(1)
+                    continue
+
+                if not self.subprocess.is_running():
+                    self.event.wait(1)
+                    continue
+
+                # Fetch CPU info
+                cpu_percent = self.subprocess.cpu_percent(interval=None)
+                normalised_cpu_percent = cpu_percent / cpu_count
+
+                # Fetch Memory info
+                mem_info = self.subprocess.memory_info()
+                total_rss = mem_info.rss
+                total_vms = mem_info.vms
+                for child in self.subprocess.children(recursive=True):
+                    try:
+                        mem = child.memory_info()
+                        total_rss += mem.rss
+                        total_vms += mem.vms
+                    except psutil.NoSuchProcess:
+                        continue
+
+                # Calculate percentage of memory used relative to total system RAM
+                total_system_ram = psutil.virtual_memory().total
+                mem_percent = (total_rss / total_system_ram) * 100
+
+                # Set values in parent worker thread
+                self.set_proc_resources_in_parent_worker(normalised_cpu_percent, total_rss, total_vms, mem_percent)
+
+                # Pause subprocesses if the worker is paused
+                if self.paused_flag.is_set():
+                    self.suspend_proc()
+
+            except psutil.NoSuchProcess:
+                self.logger.debug("No such process: %s", self.subprocess_pid)
+            except Exception:
+                self.logger.exception("Unhandled exception in WorkerMonitor.run()")
+
+            # Poll interval
+            try:
+                self.event.wait(1)
+            except Exception:
+                # In case event.wait itself misbehaves
+                self.logger.exception("Exception while waiting in WorkerMonitor.run()")
+                time.sleep(1)
+
+        self.logger.info("Exiting WorkerMonitor loop")
+
+    def stop(self):
+        self.terminate_proc()
+        self._stop_event.set()
 
 
 class Worker(threading.Thread):
@@ -64,11 +384,6 @@ class Worker(threading.Thread):
     start_time = None
     finish_time = None
 
-    worker_subprocess = None
-    worker_subprocess_pid = None
-    worker_subprocess_percent = None
-    worker_subprocess_elapsed = None
-
     worker_runners_info = {}
 
     def __init__(self, thread_id, name, worker_group_id, pending_queue, complete_queue, event):
@@ -79,8 +394,10 @@ class Worker(threading.Thread):
         self.event = event
 
         self.current_task = None
+        self.current_command = ""
         self.pending_queue = pending_queue
         self.complete_queue = complete_queue
+        self.worker_subprocess_monitor = None
 
         # Create 'redundancy' flag. When this is set, the worker should die
         self.redundant_flag = threading.Event()
@@ -91,15 +408,19 @@ class Worker(threading.Thread):
         self.paused_flag.clear()
 
         # Create logger for this worker
-        unmanic_logging = unlogger.UnmanicLogger.__call__()
-        self.logger = unmanic_logging.get_logger(self.name)
+        self.logger = UnmanicLogging.get_logger(name=__class__.__name__)
 
     def _log(self, message, message2='', level="info"):
         message = common.format_message(message, message2)
         getattr(self.logger, level)(message)
 
     def run(self):
-        self._log("Starting worker")
+        self.logger.info("Starting worker")
+
+        # Create proc monitor
+        self.worker_subprocess_monitor = WorkerSubprocessMonitor(self)
+        self.worker_subprocess_monitor.start()
+
         while not self.redundant_flag.is_set():
             self.event.wait(1)  # Add delay for preventing loop maxing compute resources
 
@@ -127,7 +448,10 @@ class Worker(threading.Thread):
                     self._log("Exception in processing job with {}:".format(self.name), message2=str(e),
                               level="exception")
 
-        self._log("Stopping worker")
+        self.logger.info("Stopping worker")
+        self.worker_subprocess_monitor.stop()
+        self.worker_subprocess_monitor.join()
+        self.worker_subprocess_monitor = None
 
     def set_task(self, new_task):
         """Sets the given task to the worker class"""
@@ -143,25 +467,23 @@ class Worker(threading.Thread):
         """
         Fetch the status of this worker.
 
-        TODO: Fetch subprocess pid
-
         :return:
         """
+        subprocess_stats = None
+        if self.worker_subprocess_monitor:
+            subprocess_stats = self.worker_subprocess_monitor.get_subprocess_stats()
         status = {
             'id':              str(self.thread_id),
             'name':            self.name,
             'idle':            self.idle,
-            'paused':          self.paused,
+            'paused':          self.paused_flag.is_set(),
             'start_time':      None if not self.start_time else str(self.start_time),
             'current_task':    None,
             'current_file':    "",
+            'current_command': self.current_command,
             'worker_log_tail': [],
             'runners_info':    {},
-            'subprocess':      {
-                'pid':     self.ident,
-                'percent': str(self.worker_subprocess_percent),
-                'elapsed': str(self.worker_subprocess_elapsed),
-            },
+            'subprocess':      subprocess_stats,
         }
         if self.current_task:
             # Fetch the current file
@@ -210,12 +532,8 @@ class Worker(threading.Thread):
         # Mark worker as not idle now that it is processing a task
         self.idle = False
 
-        # Set the progress to an empty string
-        self.worker_subprocess_percent = ''
-        self.worker_subprocess_elapsed = '0'
-
         # Log the start of the job
-        self._log("Picked up job - {}".format(self.current_task.get_source_abspath()))
+        self.logger.info("Picked up job - %s", self.current_task.get_source_abspath())
 
         # Mark as being "in progress"
         self.current_task.set_status('in_progress')
@@ -232,7 +550,7 @@ class Worker(threading.Thread):
         self.__set_finish_task_stats()
 
         # Log completion of job
-        self._log("Finished job - {}".format(self.current_task.get_source_abspath()))
+        self.logger.info("Finished job - %s", self.current_task.get_source_abspath())
 
         # Place the task into the completed queue
         self.complete_queue.put(self.current_task)
@@ -270,7 +588,7 @@ class Worker(threading.Thread):
         # Init plugins
         library_id = self.current_task.get_task_library_id()
         plugin_handler = PluginsHandler()
-        plugin_modules = plugin_handler.get_enabled_plugin_modules_by_type('worker.process_item', library_id=library_id)
+        plugin_modules = plugin_handler.get_enabled_plugin_modules_by_type('worker.process', library_id=library_id)
 
         # Create dictionary of runners info for the frontend
         self.worker_runners_info = {}
@@ -289,8 +607,9 @@ class Worker(threading.Thread):
         original_abspath = self.current_task.get_source_abspath()
 
         # Process item in loop.
-        # First process the item for for each plugin that configures it, then run the default Unmanic configuration
+        # First process the item for each plugin that configures it, then run the default Unmanic configuration
         task_cache_path = self.current_task.get_cache_path()
+        cache_directory = os.path.dirname(os.path.abspath(task_cache_path))
         # Set the current input file to the original file path
         file_in = original_abspath
         # Mark the overall success of all runners. This will be set to False if any of the runners fails.
@@ -304,12 +623,22 @@ class Worker(threading.Thread):
         # Flag if a task has run a command
         no_exec_command_run = True
 
+        # Execute event plugin runners
+        plugin_handler.run_event_plugins_for_plugin_type('events.worker_process_started', {
+            "library_id":          library_id,
+            "task_type":           self.current_task.get_task_type(),
+            "original_file_path":  original_abspath,
+            "cache_directory":     cache_directory,
+            "worker_runners_info": self.worker_runners_info,
+        })
+
         # Generate default data object for the runner functions
+        task_id = self.current_task.get_task_id()
         data = {
             "worker_log":              self.worker_log,
             "library_id":              library_id,
             "exec_command":            [],
-            "command_progress_parser": default_progress_parser,
+            "command_progress_parser": None,
             "file_in":                 file_in,
             "file_out":                None,
             "original_file_path":      original_abspath,
@@ -319,6 +648,7 @@ class Worker(threading.Thread):
         for plugin_module in plugin_modules:
             # Increment the runners count (first runner will be set as #1)
             runner_count += 1
+            runner_id = plugin_module.get('plugin_id')
 
             if not overall_success:
                 # If one of the Plugins fails, don't continue.
@@ -326,8 +656,8 @@ class Worker(threading.Thread):
                 break
 
             # Mark the status of the worker for the frontend
-            self.worker_runners_info[plugin_module.get('plugin_id')]['status'] = 'in_progress'
-            self.worker_runners_info[plugin_module.get('plugin_id')]['success'] = False
+            self.worker_runners_info[runner_id]['status'] = 'in_progress'
+            self.worker_runners_info[runner_id]['success'] = False
 
             # Loop over runner. This way we can repeat the function with the same data if requested by the repeat flag
             runner_pass_count = 0
@@ -344,21 +674,48 @@ class Worker(threading.Thread):
                 # Reset data object for this runner functions
                 data['library_id'] = library_id
                 data['exec_command'] = []
-                data['command_progress_parser'] = default_progress_parser
+                data['command_progress_parser'] = self.worker_subprocess_monitor.default_progress_parser
                 data['file_in'] = file_in
                 data['file_out'] = file_out
                 data['original_file_path'] = original_abspath
                 data['repeat'] = False
+                data['task_id'] = task_id
 
                 self.event.wait(.2)  # Add delay for preventing loop maxing compute resources
                 self.worker_log.append("\n\nRUNNER: \n{} [Pass #{}]\n\n".format(plugin_module.get('name'), runner_pass_count))
                 self.worker_log.append("\nExecuting plugin runner... Please wait\n")
 
-                # Run plugin to update data
-                if not plugin_handler.exec_plugin_runner(data, plugin_module.get('plugin_id'), 'worker.process_item'):
+                # Run plugin (in its own thread) to update data
+                result = {"success": None}
+
+                def _run_plugin():
+                    result["success"] = plugin_handler.exec_plugin_runner(
+                        data, runner_id, 'worker.process'
+                    )
+
+                runner_thread = threading.Thread(target=_run_plugin, daemon=True)
+                runner_thread.start()
+
+                # monitor the thread, bail if redundancy requested
+                while runner_thread.is_alive():
+                    if self.redundant_flag.is_set():
+                        self.logger.warning("Worker stop flag set, aborting plugin runner '%s'", runner_id)
+                        break
+                    self.event.wait(0.2)
+
+                # if we were told to shut down, mark failure and exit loop
+                if self.redundant_flag.is_set():
+                    self.worker_runners_info[runner_id]['status'] = 'complete'
+                    self.worker_runners_info[runner_id]['success'] = False
+                    overall_success = False
+                    self.worker_log.append("\n\nWORKER TERMINATED!")
+                    break
+
+                # now check the plugin result
+                if not result["success"]:
                     # Skip this plugin module's loop
-                    self.worker_runners_info[plugin_module.get('plugin_id')]['status'] = 'complete'
-                    self.worker_runners_info[plugin_module.get('plugin_id')]['success'] = False
+                    self.worker_runners_info[runner_id]['status'] = 'complete'
+                    self.worker_runners_info[runner_id]['success'] = False
                     # Set overall success status to failed
                     overall_success = False
                     # Append long entry to say the worker was terminated
@@ -368,9 +725,9 @@ class Worker(threading.Thread):
                     break
 
                 # Log the in and out files returned by the plugin runner for debugging
-                self._log("Worker process '{}' (in)".format(plugin_module.get('plugin_id')), data.get("file_in"),
+                self._log("Worker process '{}' (in)".format(runner_id), data.get("file_in"),
                           level='debug')
-                self._log("Worker process '{}' (out)".format(plugin_module.get('plugin_id')), data.get("file_out"),
+                self._log("Worker process '{}' (out)".format(runner_id), data.get("file_out"),
                           level='debug')
 
                 # Only run the conversion process if "exec_command" is not empty
@@ -385,7 +742,7 @@ class Worker(threading.Thread):
                         # This worker has been marked as redundant. It is being terminated.
                         self._log("Worker has been terminated before a command was completed", level="warning")
                         # Mark runner as failed
-                        self.worker_runners_info[plugin_module.get('plugin_id')]['success'] = False
+                        self.worker_runners_info[runner_id]['success'] = False
                         # Set overall success status to failed
                         overall_success = False
                         # Append long entry to say the worker was terminated
@@ -393,50 +750,55 @@ class Worker(threading.Thread):
                         # Don't continue
                         break
 
-                    # Run command. Check if command exited successfully.
+                    # Check if command exited successfully.
                     if success:
                         # If file conversion was successful
-                        self._log("Successfully ran worker process '{}' on file '{}'".format(plugin_module.get('plugin_id'),
-                                                                                             data.get("file_in")))
+                        self.logger.info("Successfully ran worker process '%s' on file '%s'",
+                                         runner_id,
+                                         data.get("file_in"))
+                        # Check if 'file_out' was nulled by the plugin. If it is, then we will assume that the plugin modified the file_in in-place
+                        if not data.get('file_out'):
+                            # The 'file_out' is None. Ensure the new 'file_in' is set to whatever the plugin returned for 'file_in' for the next loop
+                            file_in = data.get("file_in")
                         # Ensure the 'file_out' that was specified by the plugin to be created was actually created.
-                        if os.path.exists(data.get('file_out')):
+                        elif os.path.exists(data.get('file_out')):
                             # The outfile exists...
                             # In order to clean up as we go and avoid unnecessary RAM/disk use in the cache directory,
-                            #   we want to removed the 'file_in' file.
+                            #   we want to remove the 'file_in' file.
                             # We want to ensure that we do not accidentally remove any original files here.
-                            # To avoid this, run x2 tests.
+                            # We also want to ensure that the 'file_out' is not removed if the plugin set it to the same path as the 'file_in'.
+                            # To avoid this, run x3 tests.
                             # First, check current 'file_in' is not the original file.
                             if os.path.abspath(data.get("file_in")) != os.path.abspath(original_abspath):
-                                # Second, check that the 'file_in' is in cache directory.
+                                # Second, check that the 'file_in' is actually in cache directory. If it is not, we did not create it.
                                 if "unmanic_file_conversion" in os.path.abspath(data.get("file_in")):
-                                    # Remove this file
-                                    os.remove(os.path.abspath(data.get("file_in")))
+                                    # Finally, check that the file_out is not the same file as the file_in
+                                    if os.path.abspath(data.get("file_out")) != os.path.abspath(data.get("file_in")):
+                                        # Remove the old file_in file
+                                        os.remove(os.path.abspath(data.get("file_in")))
 
                             # Set the new 'file_in' as the previous runner's 'file_out' for the next loop
                             file_in = data.get("file_out")
                     else:
-                        # If file conversion was successful
+                        # If file conversion was not successful
                         self._log(
                             "Error while running worker process '{}' on file '{}'".format(
-                                plugin_module.get('plugin_id'),
+                                runner_id,
                                 original_abspath
                             ),
                             level="error")
-                        self.worker_runners_info[plugin_module.get('plugin_id')]['success'] = False
+                        self.worker_runners_info[runner_id]['success'] = False
                         overall_success = False
-
-                        # Ensure the new 'file_in' is set to the previous runner's 'file_in' for the next loop
-                        file_in = data.get("file_in")
                 else:
                     # Ensure the new 'file_in' is set to the previous runner's 'file_in' for the next loop
                     file_in = data.get("file_in")
                     # Log that this plugin did not request to execute anything
                     self.worker_log.append("\nRunner did not request for Unmanic to execute a command")
                     self._log(
-                        "Worker process '{}' did not request to execute a command.".format(plugin_module.get('plugin_id')),
+                        "Worker process '{}' did not request to execute a command.".format(runner_id),
                         level='debug')
 
-                if os.path.exists(data.get('file_out')):
+                if data.get('file_out') and os.path.exists(data.get('file_out')):
                     # Set the current file out to the most recently completed cache file
                     # If the file out does not exist, it is likely never used by the plugin.
                     current_file_out = data.get('file_out')
@@ -450,14 +812,16 @@ class Worker(threading.Thread):
                     continue
                 break
 
-            self.worker_runners_info[plugin_module.get('plugin_id')]['success'] = True
-            self.worker_runners_info[plugin_module.get('plugin_id')]['status'] = 'complete'
+            self.worker_runners_info[runner_id]['success'] = True
+            self.worker_runners_info[runner_id]['status'] = 'complete'
 
         # Log if no command was run by any Plugins
         if no_exec_command_run:
             # If no jobs were carried out on this task
-            self._log("No Plugin requested for Unmanic to run commands for this file '{}'".format(original_abspath), level='warning')
-            self.worker_log.append("\n\nNo Plugin requested for Unmanic to run commands for this file '{}'".format(original_abspath))
+            self._log("No Plugin requested for Unmanic to run commands for this file '{}'".format(original_abspath),
+                      level='warning')
+            self.worker_log.append(
+                "\n\nNo Plugin requested for Unmanic to run commands for this file '{}'".format(original_abspath))
 
         # Save the completed command log
         self.current_task.save_command_log(self.worker_log)
@@ -466,14 +830,13 @@ class Worker(threading.Thread):
         # At this point we need to move the final out file to the original task cache path so the postprocessor can collect it.
         if overall_success:
             # If jobs carried out on this task were all successful, we will get here
-            self._log("Successfully completed Worker processing on file '{}'".format(original_abspath))
+            self.logger.info("Successfully completed Worker processing on file '%s'", original_abspath)
 
             # Attempt to move the final output file to the final cache file path for the postprocessor
             try:
                 # Set the new file out as the extension may have changed
                 split_file_name = os.path.splitext(current_file_out)
                 file_extension = split_file_name[1].lstrip('.')
-                cache_directory = os.path.dirname(os.path.abspath(task_cache_path))
                 self.current_task.set_cache_path(cache_directory, file_extension)
                 # Read the updated cache path
                 task_cache_path = self.current_task.get_cache_path()
@@ -508,42 +871,23 @@ class Worker(threading.Thread):
             except Exception as e:
                 self._log("Exception in final move operation of file {} to {}:".format(current_file_out, task_cache_path),
                           message2=str(e), level="exception")
-                return False
+                overall_success = False
 
-            # Return True
-            return True
+        # Execute event plugin runners (only when added to queue)
+        plugin_handler.run_event_plugins_for_plugin_type('events.worker_process_complete', {
+            "library_id":          library_id,
+            "task_type":           self.current_task.get_task_type(),
+            "original_file_path":  original_abspath,
+            "final_cache_path":    task_cache_path,
+            "overall_success":     overall_success,
+            "worker_runners_info": self.worker_runners_info,
+            "worker_log":          self.worker_log,
+        })
 
-        # If the overall result of the jobs carried out on this task were not successful, we will get here.
-        # Log the failure and return False
-        self._log("Failed to process task for file '{}'".format(original_abspath), level='warning')
-        return False
-
-    def __log_proc_terminated(self, proc):
-        self._log("Process {} terminated with exit code {}".format(proc, proc.returncode))
-
-    def __terminate_proc_tree(self, proc: psutil.Process):
-        """
-        Terminate the process tree (including grandchildren).
-        Processes that fail to stop with SIGTERM will be sent a SIGKILL.
-
-        :param proc:
-        :return:
-        """
-
-        children = proc.children(recursive=True)
-        children.append(proc)
-        for p in children:
-            try:
-                p.terminate()
-            except psutil.NoSuchProcess:
-                pass
-        gone, alive = psutil.wait_procs(children, timeout=3, callback=self.__log_proc_terminated)
-        for p in alive:
-            try:
-                p.kill()
-            except psutil.NoSuchProcess:
-                pass
-        psutil.wait_procs(alive, timeout=3, callback=self.__log_proc_terminated)
+        # If the overall result of the jobs carried out on this task were not successful, log the failure and return False
+        if not overall_success:
+            self._log("Failed to process task for file '{}'".format(original_abspath), level='warning')
+        return overall_success
 
     def __exec_command_subprocess(self, data):
         """
@@ -557,13 +901,14 @@ class Worker(threading.Thread):
         exec_command = data.get("exec_command", [])
 
         # Fetch the command progress parser function
-        command_progress_parser = data.get("command_progress_parser", default_progress_parser)
+        command_progress_parser = data.get("command_progress_parser", self.worker_subprocess_monitor.default_progress_parser)
 
         # Log the command for debugging
         command_string = exec_command
         if isinstance(exec_command, list):
-            command_string = ' '.join(exec_command)
+            command_string = shlex.join(exec_command)
         self._log("Executing: {}".format(command_string), level='debug')
+        self.current_command = command_string
 
         # Append start of command to worker subprocess stdout
         self.worker_log += [
@@ -574,13 +919,12 @@ class Worker(threading.Thread):
             'LOG:\n',
         ]
 
-        # Create output path if not exists
-        common.ensure_dir(data.get("file_out"))
+        # Create output path if file_out is present and the path does not exists
+        if data.get("file_out"):
+            common.ensure_dir(data.get("file_out"))
 
         # Convert file
         try:
-            proc_pause_time = 0
-            proc_start_time = time.time()
             # Execute command
             if isinstance(exec_command, list):
                 sub_proc = subprocess.Popen(exec_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -596,6 +940,9 @@ class Worker(threading.Thread):
             # Fetch process using psutil for control (sending SIGSTOP on windows will not work)
             proc = psutil.Process(pid=sub_proc.pid)
 
+            # Create proc monitor
+            self.worker_subprocess_monitor.set_proc(sub_proc.pid)
+
             # Set process priority on posix systems
             # TODO: Test how this will work on Windows
             if os.name == "posix":
@@ -607,15 +954,22 @@ class Worker(threading.Thread):
                     self._log("Unable to lower priority of subprocess. Subprocess should continue to run at normal priority",
                               str(e), level='warning')
 
-            # Record PID and PROC
-            self.worker_subprocess = sub_proc
-            self.worker_subprocess_pid = sub_proc.pid
-
             # Poll process for new output until finished
             while not self.redundant_flag.is_set():
-                line_text = sub_proc.stdout.readline()
+
+                # Stop parsing the sub process if the worker is paused
+                # Then resume it when the worker is resumed
+                if self.paused_flag.is_set():
+                    self.logger.debug("Pausing worker exec command subprocess loop")
+                    while not self.redundant_flag.is_set():
+                        self.event.wait(1)
+                        if not self.paused_flag.is_set():
+                            self.logger.debug("Resuming worker exec command subprocess loop")
+                            break
+                        continue
 
                 # Fetch command stdout and append it to the current task object (to be saved during post process)
+                line_text = sub_proc.stdout.readline()
                 self.worker_log.append(line_text)
 
                 # Check if the command has completed. If it has, exit the loop
@@ -626,41 +980,23 @@ class Worker(threading.Thread):
                 # Parse the progress
                 try:
                     progress_dict = command_progress_parser(line_text)
-                    self.worker_subprocess_percent = progress_dict.get('percent', '0')
-                    self.worker_subprocess_elapsed = str(time.time() - proc_start_time - proc_pause_time)
+                    progress_percent = progress_dict.get('percent', 0)
+                    self.worker_subprocess_monitor.set_subprocess_percent(progress_percent)
                 except Exception as e:
                     # Only need to show any sort of exception if we have debugging enabled.
                     # So we should log it as a debug rather than an exception.
                     self._log("Exception while parsing command progress", str(e), level='debug')
-
-                # Stop the process if the worker is paused
-                # Then resume it when the worker is resumed
-                if self.paused_flag.is_set():
-                    self._log("Pausing PID {}".format(sub_proc.pid), level='debug')
-                    proc.suspend()
-                    self.paused = True
-                    start_pause = time.time()
-                    while not self.redundant_flag.is_set():
-                        self.event.wait(1)
-                        if not self.paused_flag.is_set():
-                            self._log("Resuming PID {}".format(sub_proc.pid), level='debug')
-                            proc.resume()
-                            self.paused = False
-                            # Elapsed time is used for calculating etc.
-                            # We account for this by counting the time we are paused also.
-                            # This is then subtracted from the elapsed time in the calculation above.
-                            proc_pause_time = int(proc_pause_time + time.time() - start_pause)
-                            break
-                        continue
 
             # Get the final output and the exit status
             if not self.redundant_flag.is_set():
                 communicate = sub_proc.communicate()[0]
 
             # If the process is still running, kill it
-            if proc.is_running():
-                self._log("Found worker subprocess is still running. Killing it.", level='warning')
-                self.__terminate_proc_tree(proc)
+            self.worker_subprocess_monitor.terminate_proc()
+
+            # Stop proc monitor
+            self.worker_subprocess_monitor.unset_proc()
+            self.current_command = ""
 
             if sub_proc.returncode == 0:
                 return True

@@ -31,23 +31,23 @@
 """
 import argparse
 import os
-import time
 import queue
 import signal
+import time
 import threading
 
+import psutil
+
 from unmanic import config, metadata
-from unmanic.libs import libraryscanner, unlogger, common, eventmonitor
+from unmanic.libs import libraryscanner, common, eventmonitor
 from unmanic.libs.db_migrate import Migrations
+from unmanic.libs.logs import UnmanicLogging
 from unmanic.libs.scheduler import ScheduledTasksManager
 from unmanic.libs.taskqueue import TaskQueue
 from unmanic.libs.postprocessor import PostProcessor
 from unmanic.libs.taskhandler import TaskHandler
-from unmanic.libs.uiserver import FrontendPushMessages, UIServer
+from unmanic.libs.uiserver import UIServer
 from unmanic.libs.foreman import Foreman
-
-unmanic_logging = unlogger.UnmanicLogger.__call__()
-main_logger = unmanic_logging.get_logger()
 
 
 def init_db(config_path):
@@ -78,7 +78,7 @@ def init_db(config_path):
     return db_connection
 
 
-class Service:
+class RootService:
 
     def __init__(self):
         self.threads = []
@@ -86,11 +86,17 @@ class Service:
         self.db_connection = None
 
         self.developer = None
+        self.dev_api = None
+
+        self.logger = UnmanicLogging.get_logger(name=__class__.__name__)
+        UnmanicLogging.metric("root_service_started")
 
         self.event = threading.Event()
 
+        self._mgr = None
+
     def start_handler(self, data_queues, task_queue):
-        main_logger.info("Starting TaskHandler")
+        self.logger.info("Starting TaskHandler")
         handler = TaskHandler(data_queues, task_queue, self.event)
         handler.daemon = True
         handler.start()
@@ -101,7 +107,7 @@ class Service:
         return handler
 
     def start_post_processor(self, data_queues, task_queue):
-        main_logger.info("Starting PostProcessor")
+        self.logger.info("Starting PostProcessor")
         postprocessor = PostProcessor(data_queues, task_queue, self.event)
         postprocessor.daemon = True
         postprocessor.start()
@@ -112,7 +118,7 @@ class Service:
         return postprocessor
 
     def start_foreman(self, data_queues, settings, task_queue):
-        main_logger.info("Starting Foreman")
+        self.logger.info("Starting Foreman")
         foreman = Foreman(data_queues, settings, task_queue, self.event)
         foreman.daemon = True
         foreman.start()
@@ -123,7 +129,7 @@ class Service:
         return foreman
 
     def start_library_scanner_manager(self, data_queues):
-        main_logger.info("Starting LibraryScannerManager")
+        self.logger.info("Starting LibraryScannerManager")
         library_scanner_manager = libraryscanner.LibraryScannerManager(data_queues, self.event)
         library_scanner_manager.daemon = True
         library_scanner_manager.start()
@@ -135,7 +141,7 @@ class Service:
 
     def start_inotify_watch_manager(self, data_queues, settings):
         if eventmonitor.event_monitor_module:
-            main_logger.info("Starting EventMonitorManager")
+            self.logger.info("Starting EventMonitorManager")
             event_monitor_manager = eventmonitor.EventMonitorManager(data_queues, self.event)
             event_monitor_manager.daemon = True
             event_monitor_manager.start()
@@ -145,10 +151,10 @@ class Service:
             })
             return event_monitor_manager
         else:
-            main_logger.warn("Unable to start EventMonitorManager as no event monitor module was found")
+            self.logger.warn("Unable to start EventMonitorManager as no event monitor module was found")
 
     def start_ui_server(self, data_queues, foreman):
-        main_logger.info("Starting UIServer")
+        self.logger.info("Starting UIServer")
         uiserver = UIServer(data_queues, foreman, self.developer)
         uiserver.daemon = True
         uiserver.start()
@@ -159,7 +165,7 @@ class Service:
         return uiserver
 
     def start_scheduled_tasks_manager(self):
-        main_logger.info("Starting ScheduledTasksManager")
+        self.logger.info("Starting ScheduledTasksManager")
         scheduled_tasks_manager = ScheduledTasksManager(self.event)
         scheduled_tasks_manager.daemon = True
         scheduled_tasks_manager.start()
@@ -169,10 +175,62 @@ class Service:
         })
         return scheduled_tasks_manager
 
-    @staticmethod
-    def initial_register_unmanic():
+    def start_resource_logger(self):
+        abort_flag = threading.Event()
+
+        def log_resources():
+            pid = os.getpid()
+            proc = psutil.Process(pid)
+            cpu_count = psutil.cpu_count(logical=True)
+            start_time = time.time()
+
+            while not self.event.is_set() and not abort_flag.is_set():
+                try:
+                    # Fetch CPU info
+                    cpu_percent = proc.cpu_percent(interval=None)
+                    normalised_cpu_percent = cpu_percent / cpu_count
+
+                    # Fetch Memory info
+                    mem_info = proc.memory_info()
+                    rss_bytes = mem_info.rss
+                    vms_bytes = mem_info.vms
+
+                    # Calculate percentage of memory used relative to total system RAM
+                    total_system_ram = psutil.virtual_memory().total
+                    mem_percent = (rss_bytes / total_system_ram) * 100
+
+                    # Calculate uptime in seconds
+                    uptime = int(time.time() - start_time)
+
+                    UnmanicLogging.metric("root_service_resources",
+                                          pid=pid,
+                                          uptime=uptime,
+                                          cpu_percent=normalised_cpu_percent,
+                                          mem_percent=mem_percent,
+                                          rss_bytes=rss_bytes,
+                                          vms_bytes=vms_bytes)
+                except Exception as e:
+                    self.logger.warning(f"Resource logging failed: {e}")
+                    time.sleep(5)
+                    continue
+
+                time.sleep(5)  # Polling interval
+
+        thread = threading.Thread(
+            target=log_resources,
+            name='RootServiceResourceLogger',
+            daemon=True
+        )
+        thread.stop = abort_flag.set
+        thread.start()
+        self.threads.append({
+            'name':   'RootServiceResourceLogger',
+            'thread': thread
+        })
+
+    def initial_register_unmanic(self):
         from unmanic.libs import session
-        s = session.Session()
+        s = session.Session(dev_api=self.dev_api)
         s.register_unmanic(s.get_installation_uuid())
 
     def start_threads(self, settings):
@@ -182,15 +240,13 @@ class Service:
             "scheduledtasks":           queue.Queue(),
             "inotifytasks":             queue.Queue(),
             "progress_reports":         queue.Queue(),
-            "frontend_messages":        FrontendPushMessages(),
-            "logging":                  unmanic_logging
         }
 
         # Clear cache directory
-        main_logger.info("Clearing previous cache")
+        self.logger.info("Clearing previous cache")
         common.clean_files_in_cache_dir(settings.get_cache_path())
 
-        main_logger.info("Starting all threads")
+        self.logger.info("Starting all threads")
 
         # Register installation
         self.initial_register_unmanic()
@@ -219,26 +275,49 @@ class Service:
         # Start new thread to run the scheduled tasks manager
         self.start_scheduled_tasks_manager()
 
+        # Start main thread resource logger
+        self.start_resource_logger()
+
     def stop_threads(self):
-        main_logger.info("Stopping all threads")
+        self.logger.info("Stopping all threads")
         self.event.set()
         for thread in self.threads:
-            main_logger.info("Sending thread {} abort signal".format(thread['name']))
+            self.logger.info("Sending thread {} abort signal".format(thread['name']))
             thread['thread'].stop()
         for thread in self.threads:
-            main_logger.info("Waiting for thread {} to stop".format(thread['name']))
+            self.logger.info("Waiting for thread {} to stop".format(thread['name']))
             thread['thread'].join(10)
-            main_logger.info("Thread {} has successfully stopped".format(thread['name']))
+            self.logger.info("Thread {} has successfully stopped".format(thread['name']))
         self.threads = []
 
     def sig_handle(self, signum, frame):
-        main_logger.info("Received {}".format(signum))
+        self.logger.info("Received {}".format(signum))
         self.stop()
 
     def stop(self):
         self.run_threads = False
 
     def run(self):
+        # Init the TaskDataStore and PluginChildProcess
+        import tornado.autoreload
+        from multiprocessing import Manager
+        import atexit
+        from unmanic.libs.task import TaskDataStore
+        from unmanic.libs.unplugins.child_process import kill_all_plugin_processes, set_shared_manager
+        # Init a shared manager
+        self._mgr = Manager()
+        # Ensure Manager shuts down on process exit or tornado autoreload (dev mode)
+        atexit.register(self._mgr.shutdown)
+        tornado.autoreload.add_reload_hook(self._mgr.shutdown)
+        # Ensure any PluginChildProcess shuts down on process exit or tornado autoreload (dev mode)
+        atexit.register(kill_all_plugin_processes)
+        tornado.autoreload.add_reload_hook(kill_all_plugin_processes)
+        # Replace the in-process dicts with manager proxies
+        TaskDataStore._runner_state = self._mgr.dict()
+        TaskDataStore._task_state = self._mgr.dict()
+        # Set the shared manager for PluginChildProcess
+        set_shared_manager(self._mgr)
+
         # Init the configuration
         settings = config.Config()
 
@@ -268,7 +347,7 @@ class Service:
         while not self.db_connection.is_stopped():
             time.sleep(.5)
             continue
-        main_logger.info("Exit Unmanic")
+        self.logger.info("Exit Unmanic")
 
 
 def main():
@@ -280,6 +359,8 @@ def main():
     parser.add_argument('--dev',
                         action='store_true',
                         help='Enable developer mode')
+    parser.add_argument('--dev-api', nargs='?',
+                        help='Enable development against another unmanic support api')
     parser.add_argument('--port', nargs='?',
                         help='Specify the port to run the webserver on')
     # parser.add_argument('--unmanic_path', nargs='?',
@@ -308,8 +389,9 @@ def main():
             continue
     else:
         # Run the main Unmanic service
-        service = Service()
+        service = RootService()
         service.developer = args.dev
+        service.dev_api = args.dev_api
         service.run()
 
 

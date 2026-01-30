@@ -37,7 +37,7 @@ import tornado.web
 
 from unmanic import config
 from unmanic.libs import common, session
-from unmanic.libs.uiserver import FrontendPushMessages
+from unmanic.libs.frontend_push_messages import FrontendPushMessages
 from unmanic.webserver.api_v2.base_api_handler import BaseApiHandler, BaseApiError
 from unmanic.webserver.api_v2.schema.schemas import PendingTasksTableResultsSchema
 from unmanic.webserver.helpers import pending_tasks
@@ -109,7 +109,6 @@ class ApiUploadHandler(BaseApiHandler):
 
         def receiver(chunk):
             nonlocal index
-            nonlocal frontend_messages
             if index == 0:
                 index += 1
                 split_chunk = chunk.split(SEPARATOR)
@@ -139,7 +138,7 @@ class ApiUploadHandler(BaseApiHandler):
 
         return receiver
 
-    def upload_file_to_pending_tasks(self):
+    async def upload_file_to_pending_tasks(self):
         """
         Upload - upload a new pending task
         ---
@@ -246,7 +245,7 @@ class ApiUploadHandler(BaseApiHandler):
             self.set_status(self.STATUS_ERROR_INTERNAL, reason=str(e))
             self.write_error()
 
-    def upload_and_install_plugin(self):
+    async def upload_and_install_plugin(self):
         """
         Upload - upload a plugin and install it
         ---

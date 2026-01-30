@@ -5,7 +5,9 @@
 Before building the image, you need to have built the unmanic python package:
 ```bash
 rm -rfv ./build && rm -fv ./dist/unmanic-*
-python3 ./setup.py sdist bdist_wheel
+git submodule update --init --recursive
+python3 -m build --no-isolation --skip-dependency-check --wheel
+python3 -m build --no-isolation --skip-dependency-check --sdist
 ```
 
 

@@ -29,29 +29,27 @@
            OR OTHER DEALINGS IN THE SOFTWARE.
 
 """
-
+import asyncio
 import os
 import socket
 import threading
-import asyncio
 import logging
-from queue import Queue
 
-from tornado.httpserver import HTTPServer
-from tornado.ioloop import IOLoop
-from tornado.platform.asyncio import AnyThreadEventLoopPolicy
-from tornado.routing import PathMatches
-from tornado.template import Loader
-from tornado.web import Application, StaticFileHandler, RedirectHandler
+import tornado.httpserver
+import tornado.ioloop
+import tornado.routing
+import tornado.template
+import tornado.web
 
 from unmanic import config
 from unmanic.libs import common
+from unmanic.libs.logs import UnmanicLogging
 from unmanic.libs.singleton import SingletonType
 from unmanic.webserver.downloads import DownloadsHandler
 
 public_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "webserver", "public"))
 tornado_settings = {
-    'template_loader': Loader(public_directory),
+    'template_loader': tornado.template.Loader(public_directory),
     'static_css':      os.path.join(public_directory, "css"),
     'static_fonts':    os.path.join(public_directory, "fonts"),
     'static_icons':    os.path.join(public_directory, "icons"),
@@ -60,109 +58,6 @@ tornado_settings = {
     'debug':           True,
     'autoreload':      False,
 }
-
-
-class FrontendPushMessages(Queue, metaclass=SingletonType):
-    """
-    Handles messages passed to the frontend.
-
-    Messages are sent as objects. These objects require the following fields:
-        - 'id'          : A unique ID of the message. Prevent messages duplication
-        - 'type'        : The type of message - 'error', 'warning', 'success', or 'info'
-        - 'code'        : A code to represent an I18n string for the frontend to display
-        - 'message'     : Additional message string that can be appended to the I18n string displayed on the frontend.
-        - 'timeout'     : The timeout for this message. If set to 0, then the message will persist until manually dismissed.
-
-    """
-
-    def _init(self, maxsize):
-        self.all_items = set()
-        Queue._init(self, maxsize)
-
-    def put(self, item):
-        # Ensure received item is valid
-        self.__validate_item(item)
-        # If it is not already in message list, add it to the list and the queue
-        if item.get('id') not in self.all_items:
-            self.all_items.add(item.get('id'))
-            self.add_to_queue(item)
-
-    def add_to_queue(self, item, block=True, timeout=None):
-        Queue.put(self, item, block, timeout)
-
-    @staticmethod
-    def __validate_item(item):
-        # Ensure all required keys are present
-        for key in ['id', 'type', 'code', 'message', 'timeout']:
-            if key not in item:
-                raise Exception("Frontend message item incorrectly formatted. Missing key: '{}'".format(key))
-
-        # Ensure the given type is valid
-        if item.get('type') not in ['error', 'warning', 'success', 'info', 'status']:
-            raise Exception(
-                "Frontend message item's code must be in ['error', 'warning', 'success', 'info', 'status']. Received '{}'".format(
-                    item.get('type')
-                )
-            )
-        return True
-
-    def get_all_items(self):
-        items = []
-        while not self.empty():
-            items.append(self.get())
-        return items
-
-    def requeue_items(self, items):
-        for item in items:
-            self.add_to_queue(item)
-
-    def remove_item(self, item_id):
-        # Get all items out of queue
-        current_items = self.get_all_items()
-        # Create list of items that will be queued again
-        requeue_items = []
-        for current_item in current_items:
-            if current_item.get('id') != item_id:
-                requeue_items.append(current_item)
-        # Remove the requested item ID from the all_items set
-        lock = threading.RLock()
-        lock.acquire()
-        if item_id in self.all_items:
-            self.all_items.remove(item_id)
-        lock.release()
-        # Add all requeue_items items back into the queue
-        self.requeue_items(requeue_items)
-
-    def read_all_items(self):
-        # Get all items out of queue
-        current_items = self.get_all_items()
-        # Add all requeue_items items back into the queue
-        self.requeue_items(current_items)
-        # Return items list
-        return current_items
-
-    def update(self, item):
-        # Ensure received item is valid
-        self.__validate_item(item)
-        # If it is not already in message list, add it to the list and the queue
-        if item.get('id') not in self.all_items:
-            self.all_items.add(item.get('id'))
-            self.add_to_queue(item)
-        else:
-            # Get all items out of queue
-            current_items = self.get_all_items()
-            # Create list of items that will be queued again
-            # This will not include the item requested for update
-            lock = threading.RLock()
-            lock.acquire()
-            requeue_items = []
-            for current_item in current_items:
-                if current_item.get('id') != item.get('id'):
-                    requeue_items.append(current_item)
-                    continue
-                requeue_items.append(item)
-            # Add all requeue_items items back into the queue
-            self.requeue_items(requeue_items)
 
 
 class UnmanicDataQueues(object, metaclass=SingletonType):
@@ -201,10 +96,10 @@ class UIServer(threading.Thread):
     def __init__(self, unmanic_data_queues, foreman, developer):
         super(UIServer, self).__init__(name='UIServer')
         self.config = config.Config()
+        self.logger = UnmanicLogging.get_logger(name=__class__.__name__)
 
         self.developer = developer
         self.data_queues = unmanic_data_queues
-        self.logger = unmanic_data_queues["logging"].get_logger(self.name)
         self.inotifytasks = unmanic_data_queues["inotifytasks"]
         # TODO: Move all logic out of template calling to foreman.
         #  Create methods here to handle the calls and rename to foreman
@@ -229,6 +124,7 @@ class UIServer(threading.Thread):
             self.started = False
         if self.io_loop:
             self.io_loop.add_callback(self.io_loop.stop)
+            self.io_loop.close(True)
 
     def set_logging(self):
         if self.config and self.config.get_log_path():
@@ -276,7 +172,7 @@ class UIServer(threading.Thread):
             tornado_settings['serve_traceback'] = True
 
     def run(self):
-        asyncio.set_event_loop_policy(AnyThreadEventLoopPolicy())
+        asyncio.set_event_loop(asyncio.new_event_loop())
         self.started = True
 
         # Configure tornado server based on config
@@ -288,7 +184,7 @@ class UIServer(threading.Thread):
         # TODO: add support for HTTPS
 
         # Web Server
-        self.server = HTTPServer(
+        self.server = tornado.httpserver.HTTPServer(
             self.app,
             ssl_options=None,
         )
@@ -300,19 +196,18 @@ class UIServer(threading.Thread):
                       level="warning")
             raise SystemExit
 
-        self.io_loop = IOLoop().current()
+        self.io_loop = tornado.ioloop.IOLoop.current()
         self.io_loop.start()
-        self.io_loop.close(True)
 
         self._log("Leaving UIServer loop...")
 
     def make_web_app(self):
         # Start with web application routes
         from unmanic.webserver.websocket import UnmanicWebsocketHandler
-        app = Application([
+        app = tornado.web.Application([
             (r"/unmanic/websocket", UnmanicWebsocketHandler),
             (r"/unmanic/downloads/(.*)", DownloadsHandler),
-            (r"/(.*)", RedirectHandler, dict(
+            (r"/(.*)", tornado.web.RedirectHandler, dict(
                 url="/unmanic/ui/dashboard/"
             )),
         ], **tornado_settings)
@@ -321,7 +216,7 @@ class UIServer(threading.Thread):
         from unmanic.webserver.api_request_router import APIRequestRouter
         app.add_handlers(r'.*', [
             (
-                PathMatches(r"/unmanic/api/.*"),
+                tornado.routing.PathMatches(r"/unmanic/api/.*"),
                 APIRequestRouter(app)
             ),
         ])
@@ -329,23 +224,23 @@ class UIServer(threading.Thread):
         # Add frontend routes
         from unmanic.webserver.main import MainUIRequestHandler
         app.add_handlers(r'.*', [
-            (r"/unmanic/css/(.*)", StaticFileHandler, dict(
+            (r"/unmanic/css/(.*)", tornado.web.StaticFileHandler, dict(
                 path=tornado_settings['static_css']
             )),
-            (r"/unmanic/fonts/(.*)", StaticFileHandler, dict(
+            (r"/unmanic/fonts/(.*)", tornado.web.StaticFileHandler, dict(
                 path=tornado_settings['static_fonts']
             )),
-            (r"/unmanic/icons/(.*)", StaticFileHandler, dict(
+            (r"/unmanic/icons/(.*)", tornado.web.StaticFileHandler, dict(
                 path=tornado_settings['static_icons']
             )),
-            (r"/unmanic/img/(.*)", StaticFileHandler, dict(
+            (r"/unmanic/img/(.*)", tornado.web.StaticFileHandler, dict(
                 path=tornado_settings['static_img']
             )),
-            (r"/unmanic/js/(.*)", StaticFileHandler, dict(
+            (r"/unmanic/js/(.*)", tornado.web.StaticFileHandler, dict(
                 path=tornado_settings['static_js']
             )),
             (
-                PathMatches(r"/unmanic/ui/(.*)"),
+                tornado.routing.PathMatches(r"/unmanic/ui/(.*)"),
                 MainUIRequestHandler,
             ),
         ])
@@ -356,11 +251,11 @@ class UIServer(threading.Thread):
         from unmanic.webserver.plugins import PluginAPIRequestHandler
         app.add_handlers(r'.*', [
             (
-                PathMatches(r"/unmanic/panel/[^/]+(/(?!static/|assets$).*)?$"),
+                tornado.routing.PathMatches(r"/unmanic/panel/[^/]+(/(?!static/|assets$).*)?$"),
                 DataPanelRequestHandler
             ),
             (
-                PathMatches(r"/unmanic/plugin_api/[^/]+(/(?!static/|assets$).*)?$"),
+                tornado.routing.PathMatches(r"/unmanic/plugin_api/[^/]+(/(?!static/|assets$).*)?$"),
                 PluginAPIRequestHandler
             ),
             (r"/unmanic/panel/.*/static/(.*)", PluginStaticFileHandler, dict(

@@ -45,6 +45,7 @@ components:
           example: &id001
             name:
             - The thing that went wrong.
+          additionalProperties: {}
         traceback:
           type: array
           description: Attached exception traceback (if developer mode is enabled)
@@ -91,6 +92,7 @@ components:
           type: object
           description: Attached request body validation errors
           example: *id001
+          additionalProperties: {}
         traceback:
           type: array
           description: Attached exception traceback (if developer mode is enabled)
@@ -125,6 +127,7 @@ components:
             label: /tmp
           items:
             type: object
+            additionalProperties: {}
         files:
           type: array
           minItems: 0
@@ -136,6 +139,7 @@ components:
             label: /file2.txt
           items:
             type: object
+            additionalProperties: {}
       required:
       - directories
       - files
@@ -165,15 +169,15 @@ components:
         after:
           type: string
           format: date-time
-          nullable: true
           description: Filter entries since datetime
           example: 2022-04-07 01:45
+          nullable: true
         before:
           type: string
           format: date-time
-          nullable: true
           description: Filter entries prior to datetime
           example: 2022-04-07 01:55
+          nullable: true
         order_by:
           type: string
           default: finish_time
@@ -336,6 +340,7 @@ components:
           description: The navigation links of the notification
           example:
             url: https://docs.unmanic.app
+          additionalProperties: {}
       required:
       - icon
       - label
@@ -392,15 +397,15 @@ components:
         after:
           type: string
           format: date-time
-          nullable: true
           description: Filter entries since datetime
           example: 2022-04-07 01:45
+          nullable: true
         before:
           type: string
           format: date-time
-          nullable: true
           description: Filter entries prior to datetime
           example: 2022-04-07 01:55
+          nullable: true
         order_by:
           type: string
           default: priority
@@ -570,15 +575,15 @@ components:
         after:
           type: string
           format: date-time
-          nullable: true
           description: Filter entries since datetime
           example: 2022-04-07 01:45
+          nullable: true
         before:
           type: string
           format: date-time
-          nullable: true
           description: Filter entries prior to datetime
           example: 2022-04-07 01:55
+          nullable: true
         order_by:
           type: string
           default: name
@@ -724,14 +729,14 @@ components:
           example: Downmix DTS-HD Master Audio (max 5.1 channels)?
         description:
           type: string
-          nullable: true
           description: Description of input field
           example: 'Will automatically downmix DTS-HD Master Audio to 5.1 channels '
+          nullable: true
         tooltip:
           type: string
-          nullable: true
           description: Description of input field
           example: 'Will automatically downmix DTS-HD Master Audio to 5.1 channels '
+          nullable: true
         select_options:
           type: array
           description: Additional options if the input_type is set to 'select'
@@ -742,6 +747,7 @@ components:
             label: Second Option
           items:
             type: object
+            additionalProperties: {}
         slider_options:
           type: object
           description: Additional options if the input_type is set to 'slider'
@@ -749,6 +755,7 @@ components:
             min: 1
             max: 8
             suffix: M
+          additionalProperties: {}
         display:
           type: string
           description: Should the setting input be displayed (visible, hidden)
@@ -971,7 +978,7 @@ components:
           - library_management.file_test
           - postprocessor.file_move
           - postprocessor.task_result
-          - worker.process_item
+          - worker.process
           items:
             type: string
       required:
@@ -1119,6 +1126,35 @@ components:
       required:
       - level
       - uuid
+    SessionAuthCode:
+      type: object
+      properties:
+        user_code:
+          type: string
+          description: The user code
+          example: '123456'
+        device_code:
+          type: string
+          description: A device code
+          example: 6f6867e0006f7240c9a85703a521f1705873630355f68ebbcf251a07b080172b
+        verification_uri:
+          type: string
+          description: The verification URI to submit the code manually
+          example: /support-auth-api/link
+        verification_uri_complete:
+          type: string
+          description: User email
+          example: /support-auth-api/v2/app_auth/link_with_user_code/123456
+        expires_in:
+          type: number
+          description: The time until the user_code expires
+          example: 120
+      required:
+      - device_code
+      - expires_in
+      - user_code
+      - verification_uri
+      - verification_uri_complete
     SettingsReadAndWrite:
       type: object
       properties:
@@ -1134,6 +1170,7 @@ components:
             follow_symlinks: true
             run_full_scan_on_start: false
             cache_path: /tmp/unmanic
+          additionalProperties: {}
       required:
       - settings
     SettingsSystemConfig:
@@ -1143,6 +1180,7 @@ components:
           type: object
           description: The current system configuration
           example: {}
+          additionalProperties: {}
       required:
       - configuration
     RequestSettingsRemoteInstallationAddressValidation:
@@ -1154,19 +1192,19 @@ components:
           example: 192.168.1.2:8888
         auth:
           type: string
-          nullable: true
           description: Authentication type
           example: Basic
+          nullable: true
         username:
           type: string
-          nullable: true
           description: An optional username
           example: foo
+          nullable: true
         password:
           type: string
-          nullable: true
           description: An optional password
           example: bar
+          nullable: true
       required:
       - address
     SettingsRemoteInstallationData:
@@ -1176,6 +1214,7 @@ components:
           type: object
           description: The data from the remote installation
           example: {}
+          additionalProperties: {}
       required:
       - installation
     WorkerEventScheduleResults:
@@ -1206,9 +1245,9 @@ components:
       properties:
         id:
           type: integer
-          nullable: true
           description: ''
           example: 1
+          nullable: true
         locked:
           type: boolean
           description: If the worker group is locked and cannot be deleted
@@ -1293,6 +1332,7 @@ components:
             preloading_count: 2
             enable_checksum_validation: false
             enable_config_missing_libraries: false
+          additionalProperties: {}
         distributed_worker_count_target:
           type: integer
           description: The target count of workers to be distributed across any configured
@@ -1382,6 +1422,7 @@ components:
             enable_inotify: false
             priority_score: 0
             tags: []
+          additionalProperties: {}
         plugins:
           type: object
           description: The library's enabled plugins
@@ -1392,6 +1433,7 @@ components:
               name: Notify Plex
               description: Notify Plex on completion of a task.
               icon: https://raw.githubusercontent.com/Josh5/unmanic.plugin.notify_plex/master/icon.png
+          additionalProperties: {}
       required:
       - library_config
     SettingsLibraryPluginConfigExport:
@@ -1417,7 +1459,7 @@ components:
                   using the native FFmpeg ac3 encoder.
                 version: 0.0.2
                 icon: https://raw.githubusercontent.com/Josh5/unmanic.plugin.encoder_audio_ac3/master/icon.png
-              worker.process_item:
+              worker.process:
               - plugin_id: encoder_audio_ac3
                 name: Audio Encoder AC3
                 author: Josh.5
@@ -1427,6 +1469,7 @@ components:
                 icon: https://raw.githubusercontent.com/Josh5/unmanic.plugin.encoder_audio_ac3/master/icon.png
               postprocessor.file_move: []
               postprocessor.task_result: []
+          additionalProperties: {}
         library_config:
           type: object
           description: The library configuration
@@ -1438,6 +1481,7 @@ components:
             enable_inotify: false
             priority_score: 0
             tags: []
+          additionalProperties: {}
       required:
       - plugins
     SettingsLibraryPluginConfigImport:
@@ -1447,10 +1491,12 @@ components:
           type: object
           description: The library's enabled plugins
           example: *id004
+          additionalProperties: {}
         library_config:
           type: object
           description: The library configuration
           example: *id005
+          additionalProperties: {}
         library_id:
           type: integer
           example: 1
@@ -1495,18 +1541,23 @@ components:
           example: false
         start_time:
           type: string
-          nullable: true
           description: The time when this worker started processing a task
           example: '1635746377.0021548'
+          nullable: true
         current_file:
           type: string
           description: The basename of the file currently being processed
           example: file.mp4
         current_task:
           type: integer
-          nullable: true
           description: The Task ID
           example: 1
+          nullable: true
+        current_command:
+          type: string
+          description: The command currently being executed
+          example: ffmpeg ....
+          nullable: true
         worker_log_tail:
           type: array
           minItems: 0
@@ -1538,6 +1589,7 @@ components:
               icon: https://raw.githubusercontent.com/Josh5/unmanic.plugin.video_remuxer/master/icon.png
               description: Remux a video file to the configured container
               success: true
+          additionalProperties: {}
         subprocess:
           type: object
           description: The status of the process currently being executed
@@ -1545,7 +1597,9 @@ components:
             pid: 140408939493120
             percent: None
             elapsed: None
+          additionalProperties: {}
       required:
+      - current_command
       - current_file
       - current_task
       - id
@@ -3021,6 +3075,75 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/BaseSuccess'
+        '400':
+          description: Bad request; Check `messages` for any validation errors
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadRequest'
+        '404':
+          description: Bad request; Requested endpoint not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadEndpoint'
+        '405':
+          description: Bad request; Requested method is not allowed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadMethod'
+        '500':
+          description: Internal error; Check `error` for exception
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalError'
+  /session/logout:
+    get:
+      description: Log out of the current session. Remove all session cookies and
+        unlink installation from user account.
+      responses:
+        '200':
+          description: Successful request; Returns success status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BaseSuccess'
+        '400':
+          description: Bad request; Check `messages` for any validation errors
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadRequest'
+        '404':
+          description: Bad request; Requested endpoint not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadEndpoint'
+        '405':
+          description: Bad request; Requested method is not allowed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadMethod'
+        '500':
+          description: Internal error; Check `error` for exception
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalError'
+  /session/get_app_auth_code:
+    get:
+      description: Initiates the device authentication flow.
+      responses:
+        '200':
+          description: 'Sample response: Initiates the device authentication flow.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionAuthCode'
         '400':
           description: Bad request; Check `messages` for any validation errors
           content:

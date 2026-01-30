@@ -208,4 +208,4 @@ def get_git_version_info():
         'long':  long_version_string
     }
 
-    return {"short":"0.0.0p","long":"0.0.0-i-hate-modern-software"}
+    return {"short":"0.0.0","long":"0.0.0-i-hate-modern-software"}

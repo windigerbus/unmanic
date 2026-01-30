@@ -46,16 +46,16 @@ def name():
 
 def version():
     #if is_git_vcs():
-        git_version_info = get_git_version_info()
-        return git_version_info['short']
+    git_version_info = get_git_version_info()
+    return git_version_info['short']
     #else:
     #    return str(version_info.__version__)
 
 
 def full_version():
     #if is_git_vcs():
-        git_version_info = get_git_version_info()
-        return git_version_info['long']
+    git_version_info = get_git_version_info()
+    return git_version_info['long']
     #else:
     #    return str(version_info.__version__)
 
@@ -145,7 +145,7 @@ def is_git_vcs():
     #if subprocess.call(["git", "branch"], stderr=subprocess.STDOUT, stdout=open(os.devnull, 'w')) != 0:
     #    return False
     #else:
-        return True
+    return True
 
 
 def get_git_version_info():

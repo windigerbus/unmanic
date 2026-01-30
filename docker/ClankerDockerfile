@@ -2,6 +2,13 @@
 # --- STAGE 1: Builder ---
 FROM python:3.10-slim AS builder
 RUN apt update && apt install git -y
+# Node.js und Git installieren (Git für die Versionierung, Node für das Web-UI)
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /build-area
 COPY . .
 ENV VERSION=0.0.0-pirated-i-guess

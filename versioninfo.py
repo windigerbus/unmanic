@@ -179,12 +179,12 @@ def get_git_version_info():
     #).strip().decode("utf-8")
 
     # Normalize short version string (saves getting spammed with useless warnings from setuptools about it)
-    if '-alpha' in short_version_string.lower():
-        short_version_string = short_version_string.replace("-alpha", "a")
-    elif '-beta' in short_version_string.lower():
-        short_version_string = short_version_string.replace("-beta", "b")
-    elif '-rc' in short_version_string.lower():
-        short_version_string = short_version_string.replace("-rc", "rc")
+    #if '-alpha' in short_version_string.lower():
+    #    short_version_string = short_version_string.replace("-alpha", "a")
+    #elif '-beta' in short_version_string.lower():
+    #    short_version_string = short_version_string.replace("-beta", "b")
+    #elif '-rc' in short_version_string.lower():
+    #    short_version_string = short_version_string.replace("-rc", "rc")
 
     # Append a post tag if this is not a clean tagged build
     if int(distance_since_last_tag) > 0:

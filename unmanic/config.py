@@ -54,12 +54,6 @@ class Config(object, metaclass=SingletonType):
     def __init__(self, config_path=None, **kwargs):
         # Set the default UI Port
         self.ui_port = 8888
-        self.ui_address = ''
-
-        # SSL/TLS settings
-        self.ssl_enabled = False
-        self.ssl_certfilepath = None
-        self.ssl_keyfilepath = None
 
         # Set default directories
         home_directory = common.get_home_dir()
@@ -76,8 +70,9 @@ class Config(object, metaclass=SingletonType):
 
         # Configure first run (future feature)
         self.first_run = False
+
+        # Configure first run (future feature)
         self.release_notes_viewed = None
-        self.trial_welcome_viewed = None
 
         # Library Settings:
         self.library_path = common.get_default_library_path()
@@ -88,7 +83,6 @@ class Config(object, metaclass=SingletonType):
         self.run_full_scan_on_start = False
         self.clear_pending_tasks_on_restart = True
         self.auto_manage_completed_tasks = False
-        self.compress_completed_tasks_logs = False
         self.max_age_of_completed_tasks = 91
         self.always_keep_failed_tasks = True
 
@@ -97,7 +91,6 @@ class Config(object, metaclass=SingletonType):
 
         # Link settings
         self.installation_name = ''
-        self.installation_public_address = ''
         self.remote_installations = []
         self.distributed_worker_count_target = 0
 
@@ -125,8 +118,6 @@ class Config(object, metaclass=SingletonType):
         # Overwrite all other settings passed from command params
         if kwargs.get('port'):
             self.set_config_item('ui_port', kwargs.get('port'), save_settings=False)
-        if kwargs.get('address'):
-            self.set_config_item('ui_address', kwargs.get('address'), save_settings=False)
 
         # Apply settings to the unmanic logger
         self.__setup_unmanic_logger()
@@ -188,13 +179,6 @@ class Config(object, metaclass=SingletonType):
                 logger.exception("Exception in reading saved settings from file: %s", e)
             # Set data to Config class
             self.set_bulk_config_items(data, save_settings=False)
-
-    def reload(self):
-        """
-        Reload configuration from file
-        :return:
-        """
-        self.__import_settings_from_file()
 
     def __write_settings_to_file(self):
         """
@@ -311,14 +295,6 @@ class Config(object, metaclass=SingletonType):
         """
         return self.ui_port
 
-    def get_ui_address(self):
-        """
-        Get setting - ui_address
-
-        :return:
-        """
-        return self.ui_address
-
     def get_cache_path(self):
         """
         Get setting - cache_path
@@ -411,14 +387,6 @@ class Config(object, metaclass=SingletonType):
         """
         return self.release_notes_viewed
 
-    def get_trial_welcome_viewed(self):
-        """
-        Get setting - trial_welcome_viewed
-
-        :return:
-        """
-        return self.trial_welcome_viewed
-
     def get_library_path(self):
         """
         Get setting - library_path
@@ -450,14 +418,6 @@ class Config(object, metaclass=SingletonType):
         :return:
         """
         return self.max_age_of_completed_tasks
-
-    def get_compress_completed_tasks_logs(self):
-        """
-        Get setting - compress_completed_tasks_logs
-
-        :return:
-        """
-        return self.compress_completed_tasks_logs
 
     def get_always_keep_failed_tasks(self):
         """
@@ -555,14 +515,6 @@ class Config(object, metaclass=SingletonType):
         """
         return self.installation_name
 
-    def get_installation_public_address(self):
-        """
-        Get setting - installation_public_address
-
-        :return:
-        """
-        return self.installation_public_address
-
     def get_remote_installations(self):
         """
         Get setting - remote_installations
@@ -582,30 +534,3 @@ class Config(object, metaclass=SingletonType):
         :return:
         """
         return self.distributed_worker_count_target
-
-    def get_ssl_enabled(self):
-        """
-        Get setting - ssl_enabled
-
-        :return:
-        """
-        # Convert string to boolean if necessary (for environment variables)
-        if isinstance(self.ssl_enabled, str):
-            return self.ssl_enabled.lower() in ('true', '1', 'yes', 'on')
-        return bool(self.ssl_enabled)
-
-    def get_ssl_certfilepath(self):
-        """
-        Get setting - ssl_certfilepath
-
-        :return:
-        """
-        return self.ssl_certfilepath
-
-    def get_ssl_keyfilepath(self):
-        """
-        Get setting - ssl_keyfilepath
-
-        :return:
-        """
-        return self.ssl_keyfilepath

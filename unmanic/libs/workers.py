@@ -66,10 +66,8 @@ class WorkerSubprocessMonitor(threading.Thread):
         # Set current subprocess to None
         self.subprocess_pid = None
         self.subprocess = None
-        self._tracked_processes_by_pid = {}
         self.subprocess_start_time = 0
         self.subprocess_pause_time = 0
-        self._pause_time_counter = None
 
         # Subprocess stats
         self.subprocess_percent = 0
@@ -84,7 +82,6 @@ class WorkerSubprocessMonitor(threading.Thread):
             if pid != self.subprocess_pid:
                 self.subprocess_pid = pid
                 self.subprocess = psutil.Process(pid=pid)
-                self._tracked_processes_by_pid = {pid: self.subprocess}
                 # Reset pause time
                 self.subprocess_start_time = time.time()
                 self.subprocess_pause_time = 0
@@ -104,7 +101,6 @@ class WorkerSubprocessMonitor(threading.Thread):
         try:
             self.subprocess_pid = None
             self.subprocess = None
-            self._tracked_processes_by_pid = {}
             # Reset subprocess progress
             self.subprocess_percent = 0
             self.subprocess_elapsed = 0
@@ -119,44 +115,15 @@ class WorkerSubprocessMonitor(threading.Thread):
         self.subprocess_vms_bytes = vms_bytes
         self.subprocess_mem_percent = mem_percent
 
-    def get_tracked_processes(self):
+    def suspend_proc(self):
+        # Stop the process if the worker is paused
+        # Then resume it when the worker is resumed
         try:
             if not self.subprocess or not self.subprocess.is_running():
-                return []
-
-            tracked_processes = []
-            current_pids = set()
-
-            for proc in [self.subprocess] + self.subprocess.children(recursive=True):
-                pid = proc.pid
-                current_pids.add(pid)
-                cached_proc = self._tracked_processes_by_pid.get(pid)
-                if cached_proc is None:
-                    cached_proc = proc
-                    # Prime CPU tracking once so subsequent monitor iterations return
-                    # usage for newly discovered descendants instead of a permanent 0.0.
-                    cached_proc.cpu_percent(interval=None)
-                    self._tracked_processes_by_pid[pid] = cached_proc
-                tracked_processes.append(cached_proc)
-
-            stale_pids = set(self._tracked_processes_by_pid) - current_pids
-            for pid in stale_pids:
-                self._tracked_processes_by_pid.pop(pid, None)
-
-            return tracked_processes
-        except psutil.NoSuchProcess:
-            return []
-        except Exception:
-            self.logger.exception("Exception in get_tracked_processes()")
-            return []
-
-    def suspend_proc(self):
-        # Stop the process if the worker is paused.
-        # Resume is handled separately so the monitor loop can keep running.
-        try:
-            procs = self.get_tracked_processes()
-            if not procs:
                 return
+
+            # Create list of all subprocesses - parent + all children
+            procs = [self.subprocess] + self.subprocess.children(recursive=True)
 
             # Suspend them all
             for p in procs:
@@ -167,30 +134,31 @@ class WorkerSubprocessMonitor(threading.Thread):
                     continue
 
             self.paused = True
+            pause_time_counter = time.time()
+
+            while not self.redundant_flag.is_set():
+                self.event.wait(1)
+
+                # Update pause duration on each loop
+                self.subprocess_pause_time += int(time.time() - pause_time_counter)
+                pause_time_counter = time.time()
+
+                if not self.paused_flag.is_set():
+                    # Resume in reverse order
+                    for p in reversed(procs):
+                        try:
+                            self.logger.debug("Resuming PID %s", p.pid)
+                            p.resume()
+                            # Force anything to shut down straight away if we are exiting the thread
+                            if self.redundant_flag.is_set() or self._stop_event.is_set():
+                                p.terminate()
+                        except psutil.NoSuchProcess:
+                            continue
+                    self.paused = False
+                    break
 
         except Exception:
             self.logger.exception("Exception in suspend_proc()")
-
-    def resume_proc(self):
-        try:
-            procs = self.get_tracked_processes()
-            if not procs:
-                return
-
-            # Resume in reverse order
-            for p in reversed(procs):
-                try:
-                    self.logger.debug("Resuming PID %s", p.pid)
-                    p.resume()
-                    # Force anything to shut down straight away if we are exiting the thread
-                    if self.redundant_flag.is_set() or self._stop_event.is_set():
-                        p.terminate()
-                except psutil.NoSuchProcess:
-                    continue
-            self.paused = False
-
-        except Exception:
-            self.logger.exception("Exception in resume_proc()")
 
     def terminate_proc(self):
         with self._terminate_lock:
@@ -214,79 +182,45 @@ class WorkerSubprocessMonitor(threading.Thread):
         """
         Terminate the process tree (including grandchildren).
         Ensures any suspended processes are first resumed so that
-        terminate() will actually take effect. Repeatedly rescans for
-        descendants until the root process is gone so children spawned
-        during shutdown do not escape the worker's process tree.
+        terminate() will actually take effect.  Processes that
+        fail to stop with terminate() within 3s will be killed.
 
         :param proc:
         :return:
         """
         try:
-            term_deadline = time.time() + 3
-            kill_deadline = term_deadline + 3
+            # Build the full tree
+            all_procs = proc.children(recursive=True) + [proc]
 
-            while True:
-                all_procs = self.__collect_live_proc_tree(proc)
-                if not all_procs:
-                    return
+            # Resume all suspended processes so they can handle signals
+            for p in all_procs:
+                try:
+                    p.resume()
+                except (psutil.NoSuchProcess, NotImplementedError):
+                    pass
 
-                now = time.time()
-                should_kill = now >= term_deadline
+            # Attempt graceful shutdown
+            for p in all_procs:
+                try:
+                    p.terminate()
+                except psutil.NoSuchProcess:
+                    pass
 
-                # Resume all suspended processes so they can handle signals
-                for p in all_procs:
-                    try:
-                        p.resume()
-                    except (psutil.NoSuchProcess, NotImplementedError):
-                        pass
+            # Wait up to 3s for them to exit
+            gone, alive = psutil.wait_procs(all_procs, timeout=3, callback=self.__log_proc_terminated)
 
-                for p in all_procs:
-                    try:
-                        if should_kill:
-                            p.kill()
-                        else:
-                            p.terminate()
-                    except psutil.NoSuchProcess:
-                        pass
+            # Force-kill any remaining processes
+            for p in alive:
+                try:
+                    p.kill()
+                except psutil.NoSuchProcess:
+                    pass
 
-                if should_kill:
-                    _, alive = psutil.wait_procs(all_procs, timeout=0.3, callback=self.__log_proc_terminated)
-                    if not alive:
-                        return
-                    if time.time() >= kill_deadline:
-                        self.logger.warning(
-                            "Timed out waiting for process tree rooted at PID %s to exit",
-                            proc.pid,
-                        )
-                        return
-                else:
-                    psutil.wait_procs(all_procs, timeout=0.3, callback=self.__log_proc_terminated)
+            # Final wait to reap
+            psutil.wait_procs(alive, timeout=3, callback=self.__log_proc_terminated)
 
         except Exception:
             self.logger.exception("Exception in __terminate_proc_tree()")
-
-    def __collect_live_proc_tree(self, proc: psutil.Process):
-        try:
-            proc = psutil.Process(proc.pid)
-        except psutil.NoSuchProcess:
-            return []
-
-        all_procs = []
-        pending = [proc]
-        seen_pids = set()
-
-        while pending:
-            current_proc = pending.pop()
-            if current_proc.pid in seen_pids:
-                continue
-            seen_pids.add(current_proc.pid)
-            all_procs.append(current_proc)
-            try:
-                pending.extend(current_proc.children())
-            except psutil.NoSuchProcess:
-                continue
-
-        return all_procs
 
     def get_subprocess_elapsed(self):
         try:
@@ -371,7 +305,7 @@ class WorkerSubprocessMonitor(threading.Thread):
 
     def run(self):
         # First fetch the number of CPUs for normalising the CPU percent
-        cpu_count = psutil.cpu_count(logical=True) or 1
+        cpu_count = psutil.cpu_count(logical=True)
         # Loop while thread is expected to be running
         self.logger.warning("Starting WorkerMonitor loop")
         while True:
@@ -394,27 +328,21 @@ class WorkerSubprocessMonitor(threading.Thread):
                     self.event.wait(1)
                     continue
 
-                # Aggregate resource usage across the full tracked process tree.
-                # This keeps PluginChildProcess reporting aligned with direct subprocess execution,
-                # where the worker's tracked PID may be a lightweight wrapper around a heavy child.
-                tracked_procs = self.get_tracked_processes()
-                if not tracked_procs:
-                    self.event.wait(1)
-                    continue
-
                 # Fetch CPU info
-                total_cpu_percent = 0
-                total_rss = 0
-                total_vms = 0
-                for proc in tracked_procs:
+                cpu_percent = self.subprocess.cpu_percent(interval=None)
+                normalised_cpu_percent = cpu_percent / cpu_count
+
+                # Fetch Memory info
+                mem_info = self.subprocess.memory_info()
+                total_rss = mem_info.rss
+                total_vms = mem_info.vms
+                for child in self.subprocess.children(recursive=True):
                     try:
-                        total_cpu_percent += proc.cpu_percent(interval=None)
-                        mem = proc.memory_info()
+                        mem = child.memory_info()
                         total_rss += mem.rss
                         total_vms += mem.vms
                     except psutil.NoSuchProcess:
                         continue
-                normalised_cpu_percent = total_cpu_percent / cpu_count
 
                 # Calculate percentage of memory used relative to total system RAM
                 total_system_ram = psutil.virtual_memory().total
@@ -423,20 +351,9 @@ class WorkerSubprocessMonitor(threading.Thread):
                 # Set values in parent worker thread
                 self.set_proc_resources_in_parent_worker(normalised_cpu_percent, total_rss, total_vms, mem_percent)
 
-                # Pause/resume subprocesses while keeping the monitor loop alive
+                # Pause subprocesses if the worker is paused
                 if self.paused_flag.is_set():
-                    if not self.paused:
-                        self.suspend_proc()
-                        self._pause_time_counter = time.time()
-                    elif self._pause_time_counter is not None:
-                        self.subprocess_pause_time += int(time.time() - self._pause_time_counter)
-                        self._pause_time_counter = time.time()
-                    self.event.wait(1)
-                elif self.paused:
-                    if self._pause_time_counter is not None:
-                        self.subprocess_pause_time += int(time.time() - self._pause_time_counter)
-                    self.resume_proc()
-                    self._pause_time_counter = None
+                    self.suspend_proc()
 
             except psutil.NoSuchProcess:
                 self.logger.debug("No such process: %s", self.subprocess_pid)
@@ -477,7 +394,7 @@ class Worker(threading.Thread):
         self.event = event
 
         self.current_task = None
-        self.current_command_ref = None
+        self.current_command = ""
         self.pending_queue = pending_queue
         self.complete_queue = complete_queue
         self.worker_subprocess_monitor = None
@@ -492,6 +409,10 @@ class Worker(threading.Thread):
 
         # Create logger for this worker
         self.logger = UnmanicLogging.get_logger(name=__class__.__name__)
+
+    def _log(self, message, message2='', level="info"):
+        message = common.format_message(message, message2)
+        getattr(self.logger, level)(message)
 
     def run(self):
         self.logger.info("Starting worker")
@@ -524,7 +445,8 @@ class Worker(threading.Thread):
                 except queue.Empty:
                     continue
                 except Exception as e:
-                    self.logger.exception("Exception in processing job with %s: %s", self.name, e)
+                    self._log("Exception in processing job with {}:".format(self.name), message2=str(e),
+                              level="exception")
 
         self.logger.info("Stopping worker")
         self.worker_subprocess_monitor.stop()
@@ -550,14 +472,6 @@ class Worker(threading.Thread):
         subprocess_stats = None
         if self.worker_subprocess_monitor:
             subprocess_stats = self.worker_subprocess_monitor.get_subprocess_stats()
-        current_command = ""
-        try:
-            if self.current_command_ref:
-                shared_command = self.current_command_ref[-1]
-                if shared_command:
-                    current_command = shared_command
-        except Exception as e:
-            self.logger.exception("Exception in fetching current command of worker %s: %s", self.name, e)
         status = {
             'id':              str(self.thread_id),
             'name':            self.name,
@@ -566,7 +480,7 @@ class Worker(threading.Thread):
             'start_time':      None if not self.start_time else str(self.start_time),
             'current_task':    None,
             'current_file':    "",
-            'current_command': current_command,
+            'current_command': self.current_command,
             'worker_log_tail': [],
             'runners_info':    {},
             'subprocess':      subprocess_stats,
@@ -576,28 +490,32 @@ class Worker(threading.Thread):
             try:
                 status['current_task'] = self.current_task.get_task_id()
             except Exception as e:
-                self.logger.exception("Exception in fetching the current task ID for worker %s: %s", self.name, e)
+                self._log("Exception in fetching the current task ID for worker {}:".format(self.name), message2=str(e),
+                          level="exception")
 
             # Fetch the current file
             try:
                 status['current_file'] = self.current_task.get_source_basename()
             except Exception as e:
-                self.logger.exception("Exception in fetching the current file of worker %s: %s", self.name, e)
+                self._log("Exception in fetching the current file of worker {}:".format(self.name), message2=str(e),
+                          level="exception")
 
             # Append the worker log tail
             try:
-                if self.worker_log and len(self.worker_log) > 40:
-                    status['worker_log_tail'] = self.worker_log[-39:]
+                if self.worker_log and len(self.worker_log) > 20:
+                    status['worker_log_tail'] = self.worker_log[-19:]
                 else:
                     status['worker_log_tail'] = self.worker_log
             except Exception as e:
-                self.logger.exception("Exception in fetching log tail of worker: %s", e)
+                self._log("Exception in fetching log tail of worker: ", message2=str(e),
+                          level="exception")
 
             # Append the runners info
             try:
                 status['runners_info'] = self.worker_runners_info
             except Exception as e:
-                self.logger.exception("Exception in runners info of worker %s: %s", self.name, e)
+                self._log("Exception in runners info of worker {}:".format(self.name), message2=str(e),
+                          level="exception")
         return status
 
     def __unset_current_task(self):
@@ -617,11 +535,11 @@ class Worker(threading.Thread):
         # Log the start of the job
         self.logger.info("Picked up job - %s", self.current_task.get_source_abspath())
 
-        # Start current task stats
-        self.__set_start_task_stats()
-
         # Mark as being "in progress"
         self.current_task.set_status('in_progress')
+
+        # Start current task stats
+        self.__set_start_task_stats()
 
         # Process the file. Will return true if success, otherwise false
         success = self.__exec_worker_runners_on_set_task()
@@ -649,7 +567,7 @@ class Worker(threading.Thread):
         self.finish_time = None
 
         # Format our starting statistics data
-        self.current_task.task.processed_by_worker = str(self.name)
+        self.current_task.task.processed_by_worker = self.name
         self.current_task.task.start_time = self.start_time
         self.current_task.task.finish_time = self.finish_time
 
@@ -708,7 +626,6 @@ class Worker(threading.Thread):
         # Execute event plugin runners
         plugin_handler.run_event_plugins_for_plugin_type('events.worker_process_started', {
             "library_id":          library_id,
-            "task_id":             self.current_task.get_task_id(),
             "task_type":           self.current_task.get_task_type(),
             "original_file_path":  original_abspath,
             "cache_directory":     cache_directory,
@@ -721,7 +638,6 @@ class Worker(threading.Thread):
             "worker_log":              self.worker_log,
             "library_id":              library_id,
             "exec_command":            [],
-            "current_command":         [],
             "command_progress_parser": None,
             "file_in":                 file_in,
             "file_out":                None,
@@ -758,17 +674,15 @@ class Worker(threading.Thread):
                 # Reset data object for this runner functions
                 data['library_id'] = library_id
                 data['exec_command'] = []
-                data['current_command'] = []
                 data['command_progress_parser'] = self.worker_subprocess_monitor.default_progress_parser
                 data['file_in'] = file_in
                 data['file_out'] = file_out
                 data['original_file_path'] = original_abspath
                 data['repeat'] = False
                 data['task_id'] = task_id
-                self.current_command_ref = data['current_command']
 
                 self.event.wait(.2)  # Add delay for preventing loop maxing compute resources
-                self.worker_log.append(f"\n\nRUNNER: \n{plugin_module.get('name')} [Pass #{runner_pass_count}]\n\n")
+                self.worker_log.append("\n\nRUNNER: \n{} [Pass #{}]\n\n".format(plugin_module.get('name'), runner_pass_count))
                 self.worker_log.append("\nExecuting plugin runner... Please wait\n")
 
                 # Run plugin (in its own thread) to update data
@@ -808,34 +722,31 @@ class Worker(threading.Thread):
                     self.worker_log.append("\n\nPLUGIN FAILED!")
                     self.worker_log.append("\nFailed to execute Plugin '{}'".format(plugin_module.get('name')))
                     self.worker_log.append("\nCheck Unmanic logs for more information")
-                    self.current_command_ref = None
-                    data['current_command'] = []
                     break
 
                 # Log the in and out files returned by the plugin runner for debugging
-                self.logger.debug("Worker process '%s' (in) %s", runner_id, data.get("file_in"))
-                self.logger.debug("Worker process '%s' (out) %s", runner_id, data.get("file_out"))
+                self._log("Worker process '{}' (in)".format(runner_id), data.get("file_in"),
+                          level='debug')
+                self._log("Worker process '{}' (out)".format(runner_id), data.get("file_out"),
+                          level='debug')
 
                 # Only run the conversion process if "exec_command" is not empty
                 if data.get("exec_command"):
                     self.worker_log.append("\nPlugin runner requested for a command to be executed by Unmanic")
 
                     # Exec command as subprocess
-                    self.current_command_ref = data['current_command']
                     success = self.__exec_command_subprocess(data)
                     no_exec_command_run = False
 
                     if self.redundant_flag.is_set():
                         # This worker has been marked as redundant. It is being terminated.
-                        self.logger.warning("Worker has been terminated before a command was completed")
+                        self._log("Worker has been terminated before a command was completed", level="warning")
                         # Mark runner as failed
                         self.worker_runners_info[runner_id]['success'] = False
                         # Set overall success status to failed
                         overall_success = False
                         # Append long entry to say the worker was terminated
                         self.worker_log.append("\n\nWORKER TERMINATED!")
-                        self.current_command_ref = None
-                        data['current_command'] = []
                         # Don't continue
                         break
 
@@ -870,9 +781,12 @@ class Worker(threading.Thread):
                             file_in = data.get("file_out")
                     else:
                         # If file conversion was not successful
-                        self.logger.error("Error while running worker process '%s' on file '%s'",
-                                          runner_id,
-                                          original_abspath)
+                        self._log(
+                            "Error while running worker process '{}' on file '{}'".format(
+                                runner_id,
+                                original_abspath
+                            ),
+                            level="error")
                         self.worker_runners_info[runner_id]['success'] = False
                         overall_success = False
                 else:
@@ -880,7 +794,9 @@ class Worker(threading.Thread):
                     file_in = data.get("file_in")
                     # Log that this plugin did not request to execute anything
                     self.worker_log.append("\nRunner did not request for Unmanic to execute a command")
-                    self.logger.debug("Worker process '%s' did not request to execute a command.", runner_id)
+                    self._log(
+                        "Worker process '{}' did not request to execute a command.".format(runner_id),
+                        level='debug')
 
                 if data.get('file_out') and os.path.exists(data.get('file_out')):
                     # Set the current file out to the most recently completed cache file
@@ -890,12 +806,8 @@ class Worker(threading.Thread):
                     # Ensure the current_file_out is set the currently set 'file_in'
                     current_file_out = data.get('file_in')
 
-                # Exec command was handled, clear shared command reference for the UI.
-                self.current_command_ref = None
-                data['current_command'] = []
-
                 if data.get("repeat"):
-                    # The returned data contained the 'repeat' flag.
+                    # The returned data contained the 'repeat'' flag.
                     # Run another pass against this same plugin
                     continue
                 break
@@ -906,7 +818,8 @@ class Worker(threading.Thread):
         # Log if no command was run by any Plugins
         if no_exec_command_run:
             # If no jobs were carried out on this task
-            self.logger.warning("No Plugin requested for Unmanic to run commands for this file '%s'", original_abspath)
+            self._log("No Plugin requested for Unmanic to run commands for this file '{}'".format(original_abspath),
+                      level='warning')
             self.worker_log.append(
                 "\n\nNo Plugin requested for Unmanic to run commands for this file '{}'".format(original_abspath))
 
@@ -929,7 +842,7 @@ class Worker(threading.Thread):
                 task_cache_path = self.current_task.get_cache_path()
 
                 # Move file to original cache path
-                self.logger.info("Moving final cache file from '%s' to '%s'", current_file_out, task_cache_path)
+                self._log("Moving final cache file from '{}' to '{}'".format(current_file_out, task_cache_path))
                 current_file_out = os.path.abspath(current_file_out)
 
                 # There is a really odd intermittent bug with the shutil module that is causing it to
@@ -937,7 +850,7 @@ class Worker(threading.Thread):
                 # This section adds a small pause and logs the error if that is the case.
                 # I have not yet figured out a solution as this is difficult to reproduce.
                 if not os.path.exists(current_file_out):
-                    self.logger.error("Error - current_file_out path does not exist! '%s'", file_in)
+                    self._log("Error - current_file_out path does not exist! '{}'".format(file_in), level="error")
                     self.event.wait(1)
 
                 # Ensure the cache directory exists
@@ -950,22 +863,19 @@ class Worker(threading.Thread):
                     # This can happen if all Plugins failed to run, or a Plugin specifically reset the out
                     #   file to the original source in order to preserve it.
                     # In this circumstance, we want to create a cache copy and let the process continue.
-                    self.logger.debug("Final cache file is the same path as the original source. Creating cache copy.")
+                    self._log("Final cache file is the same path as the original source. Creating cache copy.", level='debug')
                     shutil.copyfile(current_file_out, task_cache_path)
                 else:
                     # Use shutil module to move the file to the final task cache location
                     shutil.move(current_file_out, task_cache_path)
             except Exception as e:
-                self.logger.exception("Exception in final move operation of file %s to %s: %s",
-                                      current_file_out,
-                                      task_cache_path,
-                                      e)
+                self._log("Exception in final move operation of file {} to {}:".format(current_file_out, task_cache_path),
+                          message2=str(e), level="exception")
                 overall_success = False
 
         # Execute event plugin runners (only when added to queue)
         plugin_handler.run_event_plugins_for_plugin_type('events.worker_process_complete', {
             "library_id":          library_id,
-            "task_id":             self.current_task.get_task_id(),
             "task_type":           self.current_task.get_task_type(),
             "original_file_path":  original_abspath,
             "final_cache_path":    task_cache_path,
@@ -976,7 +886,7 @@ class Worker(threading.Thread):
 
         # If the overall result of the jobs carried out on this task were not successful, log the failure and return False
         if not overall_success:
-            self.logger.warning("Failed to process task for file '%s'", original_abspath)
+            self._log("Failed to process task for file '{}'".format(original_abspath), level='warning')
         return overall_success
 
     def __exec_command_subprocess(self, data):
@@ -991,18 +901,14 @@ class Worker(threading.Thread):
         exec_command = data.get("exec_command", [])
 
         # Fetch the command progress parser function
-        command_progress_parser = data.get("command_progress_parser",
-                                           self.worker_subprocess_monitor.default_progress_parser)
+        command_progress_parser = data.get("command_progress_parser", self.worker_subprocess_monitor.default_progress_parser)
 
         # Log the command for debugging
         command_string = exec_command
         if isinstance(exec_command, list):
             command_string = shlex.join(exec_command)
-        self.logger.debug("Executing: %s", command_string)
-        current_command_ref = data.get("current_command")
-        if isinstance(current_command_ref, list):
-            current_command_ref.clear()
-            current_command_ref.append(command_string)
+        self._log("Executing: {}".format(command_string), level='debug')
+        self.current_command = command_string
 
         # Append start of command to worker subprocess stdout
         self.worker_log += [
@@ -1045,8 +951,8 @@ class Worker(threading.Thread):
                     parent_proc_nice = parent_proc.nice()
                     proc.nice(parent_proc_nice + 1)
                 except Exception as e:
-                    self.logger.warning("Unable to lower priority of subprocess. Subprocess should continue to run at normal priority: %s",
-                                        e)
+                    self._log("Unable to lower priority of subprocess. Subprocess should continue to run at normal priority",
+                              str(e), level='warning')
 
             # Poll process for new output until finished
             while not self.redundant_flag.is_set():
@@ -1068,7 +974,7 @@ class Worker(threading.Thread):
 
                 # Check if the command has completed. If it has, exit the loop
                 if line_text == '' and sub_proc.poll() is not None:
-                    self.logger.debug("Subprocess task completed!")
+                    self._log("Subprocess task completed!", level='debug')
                     break
 
                 # Parse the progress
@@ -1079,7 +985,7 @@ class Worker(threading.Thread):
                 except Exception as e:
                     # Only need to show any sort of exception if we have debugging enabled.
                     # So we should log it as a debug rather than an exception.
-                    self.logger.debug("Exception while parsing command progress: %s", e)
+                    self._log("Exception while parsing command progress", str(e), level='debug')
 
             # Get the final output and the exit status
             if not self.redundant_flag.is_set():
@@ -1090,21 +996,18 @@ class Worker(threading.Thread):
 
             # Stop proc monitor
             self.worker_subprocess_monitor.unset_proc()
-            if isinstance(current_command_ref, list):
-                current_command_ref.clear()
+            self.current_command = ""
 
             if sub_proc.returncode == 0:
                 return True
             else:
-                self.logger.error("Command run against '%s' exited with non-zero status. "
-                                  "Download command dump from history for more information. %s",
-                                  data.get("file_in"),
-                                  exec_command)
+                self._log("Command run against '{}' exited with non-zero status. "
+                          "Download command dump from history for more information.".format(data.get("file_in")),
+                          message2=str(exec_command), level="error")
                 return False
 
         except Exception as e:
-            self.logger.error("Error while executing the command against file %s. %s",
-                              data.get("file_in"),
-                              e)
+            self._log("Error while executing the command against file{}.".format(data.get("file_in")), message2=str(e),
+                      level="error")
 
         return False

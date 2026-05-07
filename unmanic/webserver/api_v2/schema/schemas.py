@@ -320,20 +320,10 @@ class CompletedTasksTableResultsSchema(BaseSchema):
         description="Item success status",
         example=True,
     )
-    start_time = fields.Int(
-        required=True,
-        description="Item start time",
-        example=1627392550.123456,
-    )
     finish_time = fields.Int(
         required=True,
         description="Item finish time",
         example=1627392616.6400812,
-    )
-    has_metadata = fields.Boolean(
-        required=True,
-        description="Item has linked file metadata",
-        example=False,
     )
 
 
@@ -393,187 +383,7 @@ class CompletedTasksLogSchema(BaseSchema):
     )
 
 
-class RequestMetadataByTaskSchema(BaseSchema):
-    """Schema for requesting metadata by task ID"""
-
-    task_id = fields.Int(
-        required=True,
-        description="The ID of the completed task",
-        example=1,
-    )
-
-
-class RequestMetadataSearchSchema(BaseSchema):
-    """Schema for searching metadata by file path"""
-
-    path = fields.Str(
-        required=False,
-        allow_none=True,
-        description="Absolute path to search for metadata",
-        example="/mnt/user/Movies/Example.mkv",
-    )
-    offset = fields.Int(
-        required=False,
-        allow_none=True,
-        description="Pagination offset",
-        example=0,
-    )
-    limit = fields.Int(
-        required=False,
-        allow_none=True,
-        description="Pagination limit",
-        example=50,
-    )
-
-
-class MetadataEntrySchema(BaseSchema):
-    """Schema for a metadata record"""
-
-    fingerprint = fields.Str(
-        required=True,
-        description="File fingerprint",
-        example="abc123",
-    )
-    fingerprint_algo = fields.Str(
-        required=True,
-        description="Fingerprint algorithm identifier",
-        example="sampled_sha256_v1",
-    )
-    metadata_json = fields.Dict(
-        required=True,
-        description="Metadata blob keyed by plugin ID",
-        example={
-            "example_plugin": {"status": "ignored"},
-        },
-    )
-    last_task_id = fields.Int(
-        required=False,
-        allow_none=True,
-        description="Most recent completed task ID that wrote metadata",
-        example=42,
-    )
-    paths = fields.List(
-        fields.Dict(),
-        required=False,
-        description="Associated file paths for this fingerprint",
-        example=[{"path": "/mnt/user/Movies/Example.mkv", "path_type": "destination"}],
-    )
-
-
-class MetadataSearchResultsSchema(BaseSchema):
-    """Schema for returning metadata search results"""
-
-    results = fields.Nested(
-        MetadataEntrySchema,
-        required=True,
-        description="Results",
-        many=True,
-        validate=validate.Length(min=0),
-    )
-    total_count = fields.Int(
-        required=True,
-        description="Total number of matching records",
-        example=120,
-    )
-
-
-class RequestMetadataUpdateSchema(BaseSchema):
-    """Schema for updating metadata for a fingerprint"""
-
-    fingerprint = fields.Str(
-        required=True,
-        description="File fingerprint",
-        example="abc123",
-    )
-    plugin_id = fields.Str(
-        required=True,
-        description="Plugin identifier",
-        example="mover2",
-    )
-    json_blob = fields.Dict(
-        required=True,
-        description="Plugin metadata dict to merge",
-        example={"status": "ignored"},
-    )
-
-
-class RequestMetadataByFingerprintSchema(BaseSchema):
-    """Schema for requesting metadata by fingerprint"""
-
-    fingerprint = fields.Str(
-        required=True,
-        description="File fingerprint",
-        example="abc123",
-    )
-
-
-class RequestMetadataDeleteSchema(BaseSchema):
-    """Schema for deleting metadata"""
-
-    fingerprint = fields.Str(
-        required=True,
-        description="File fingerprint",
-        example="abc123",
-    )
-    plugin_id = fields.Str(
-        required=False,
-        allow_none=True,
-        description="Plugin identifier to delete (omit to delete all)",
-        example="mover2",
-    )
-
-
-class RequestCompletedTasksBulkActionSchema(BaseSchema):
-    """Schema for bulk actions on completed tasks"""
-
-    selection_mode = fields.Str(
-        required=False,
-        load_default="explicit",
-        validate=validate.OneOf(["explicit", "all_filtered"]),
-        example="explicit",
-    )
-    id_list = fields.List(
-        cls_or_instance=fields.Int,
-        required=False,
-        description="List of table IDs",
-        example=[],
-        validate=validate.Length(min=1),
-    )
-    exclude_ids = fields.List(
-        cls_or_instance=fields.Int,
-        required=False,
-        description="List of table IDs to exclude when using a filtered selection",
-        example=[],
-        load_default=[],
-        validate=validate.Length(min=0),
-    )
-    search_value = fields.Str(
-        required=False,
-        description="String to filter search results by",
-        example="items with this text in the value",
-        load_default="",
-    )
-    status = fields.Str(
-        required=False,
-        description="Filter on the status",
-        example="all",
-        load_default="all",
-    )
-    after = fields.DateTime(
-        required=False,
-        description="Filter entries since datetime",
-        example="2022-04-07 01:45",
-        allow_none=True,
-    )
-    before = fields.DateTime(
-        required=False,
-        description="Filter entries prior to datetime",
-        example="2022-04-07 01:55",
-        allow_none=True,
-    )
-
-
-class RequestAddCompletedToPendingTasksSchema(RequestCompletedTasksBulkActionSchema):
+class RequestAddCompletedToPendingTasksSchema(RequestTableUpdateByIdList):
     """Schema for adding a completed task to the pending task queue"""
 
     library_id = fields.Int(
@@ -643,54 +453,6 @@ class RequestPendingTableDataSchema(RequestTableDataSchema):
         example="priority",
         load_default="priority",
     )
-    library_ids = fields.List(
-        cls_or_instance=fields.Int,
-        required=False,
-        description="Filter pending tasks by library IDs",
-        example=[1, 3],
-        load_default=[],
-        validate=validate.Length(min=0),
-    )
-
-
-class RequestPendingTasksBulkActionSchema(BaseSchema):
-    """Schema for bulk actions on pending tasks"""
-
-    selection_mode = fields.Str(
-        required=False,
-        load_default="explicit",
-        validate=validate.OneOf(["explicit", "all_filtered"]),
-        example="explicit",
-    )
-    id_list = fields.List(
-        cls_or_instance=fields.Int,
-        required=False,
-        description="List of table IDs",
-        example=[],
-        validate=validate.Length(min=1),
-    )
-    exclude_ids = fields.List(
-        cls_or_instance=fields.Int,
-        required=False,
-        description="List of table IDs to exclude when using a filtered selection",
-        example=[],
-        load_default=[],
-        validate=validate.Length(min=0),
-    )
-    search_value = fields.Str(
-        required=False,
-        description="String to filter search results by",
-        example="items with this text in the value",
-        load_default="",
-    )
-    library_ids = fields.List(
-        cls_or_instance=fields.Int,
-        required=False,
-        description="Filter pending tasks by library IDs",
-        example=[1, 3],
-        load_default=[],
-        validate=validate.Length(min=0),
-    )
 
 
 class PendingTasksTableResultsSchema(BaseSchema):
@@ -750,7 +512,7 @@ class PendingTasksSchema(TableRecordsSuccessSchema):
     )
 
 
-class RequestPendingTasksReorderSchema(RequestPendingTasksBulkActionSchema):
+class RequestPendingTasksReorderSchema(RequestTableUpdateByIdList):
     """Schema for moving pending items to top or bottom of table by ID"""
 
     position = fields.Str(
@@ -788,67 +550,6 @@ class RequestPendingTaskCreateSchema(BaseSchema):
         required=False,
         description="Apply a priority score to the created task to either increase or decrease its position in the queue",
         example=1000,
-    )
-
-
-class RequestPendingTaskTestSchema(BaseSchema):
-    """Schema for requesting a file test without creating a pending task"""
-
-    path = fields.Str(
-        required=True,
-        description="The path to a file (absolute or relative to the selected library)",
-        example="/library/TEST_FILE.mkv",
-    )
-    library_id = fields.Int(
-        required=False,
-        description="The ID of the library to use for plugin configuration",
-        example=1,
-    )
-    library_name = fields.Str(
-        required=False,
-        description="The name of the library to use for plugin configuration",
-        example='Default',
-    )
-
-
-class PendingTaskTestResultSchema(BaseSchema):
-    """Schema for file test results without queueing a task"""
-
-    path = fields.Str(
-        required=True,
-        description="The absolute path to the tested file",
-        example="/library/TEST_FILE.mkv",
-    )
-    library_id = fields.Int(
-        required=True,
-        description="The library ID used to run the file tests",
-        example=1,
-    )
-    library_name = fields.Str(
-        required=True,
-        description="The library name used to run the file tests",
-        example="Default",
-    )
-    add_file_to_pending_tasks = fields.Boolean(
-        required=False,
-        allow_none=True,
-        description="Final decision after file tests (true: plugin requested queueing, false: plugin rejected, null: no plugin decided)",
-        example=True,
-    )
-    issues = fields.List(
-        fields.Dict(),
-        required=False,
-        description="Any issues that prevented the file from being queued",
-        example=[],
-    )
-    decision_plugin = fields.Dict(
-        required=False,
-        allow_none=True,
-        description="The plugin that set add_file_to_pending_tasks (null if no plugin decided)",
-        example={
-            "plugin_id": "example_library_management_file_test",
-            "plugin_name": "Example Library Test",
-        },
     )
 
 
@@ -1276,11 +977,6 @@ class PluginReposMetadataResultsSchema(BaseSchema):
         required=True,
         description="The plugin repo URL path",
         example="https://raw.githubusercontent.com/Josh5/unmanic-plugins/repo/repo.json",
-    )
-    repo_html_url = fields.Str(
-        required=False,
-        description="The plugin repo HTML URL (e.g. GitHub repository page)",
-        example="https://github.com/Josh5/unmanic-plugins",
     )
 
 

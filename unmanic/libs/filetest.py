@@ -111,7 +111,6 @@ class FileTest(object):
         :return:
         """
         return_value = None
-        decision_plugin = None
         file_issues = []
 
         # TODO: Remove this
@@ -158,15 +157,11 @@ class FileTest(object):
                 # No need to continue.
                 if data.get('add_file_to_pending_tasks') is not None:
                     return_value = data.get('add_file_to_pending_tasks')
-                    decision_plugin = {
-                        'plugin_id':   plugin_module.get('plugin_id'),
-                        'plugin_name': plugin_module.get('name'),
-                    }
                     break
             # Set the priority score modification
             priority_score_modification = data.get('priority_score', 0)
 
-        return return_value, file_issues, priority_score_modification, decision_plugin
+        return return_value, file_issues, priority_score_modification
 
 
 class FileTesterThread(threading.Thread):
@@ -181,19 +176,9 @@ class FileTesterThread(threading.Thread):
         self.status_updates = status_updates
         self.abort_flag = threading.Event()
         self.abort_flag.clear()
-        self._testing_lock = threading.Lock()
-        self._currently_testing = False
 
     def stop(self):
         self.abort_flag.set()
-
-    def _set_testing_state(self, state):
-        with self._testing_lock:
-            self._currently_testing = state
-
-    def is_testing_file(self):
-        with self._testing_lock:
-            return self._currently_testing
 
     def run(self):
         self.logger.info("Starting %s", self.name)
@@ -203,20 +188,17 @@ class FileTesterThread(threading.Thread):
             try:
                 # Pending task queue has an item available. Fetch it.
                 next_file = self.files_to_test.get_nowait()
-                self._set_testing_state(True)
                 self.status_updates.put(next_file)
             except queue.Empty:
-                self._set_testing_state(False)
                 self.event.wait(2)
                 continue
             except Exception as e:
                 self.logger.exception("Exception in fetching library scan result for path %s:", self.name)
-                self._set_testing_state(False)
                 continue
 
             # Test file to be added to task list. Add it if required
             try:
-                result, issues, priority_score, _ = file_test.should_file_be_added_to_task_list(next_file)
+                result, issues, priority_score = file_test.should_file_be_added_to_task_list(next_file)
                 # Log any error messages
                 for issue in issues:
                     if type(issue) is dict:
@@ -241,8 +223,6 @@ class FileTesterThread(threading.Thread):
                 self.logger.warning("File contains Unicode characters that cannot be processed. Ignoring.")
             except Exception as e:
                 self.logger.exception("Exception testing file path in %s. Ignoring.", self.name)
-            finally:
-                self._set_testing_state(False)
 
         self.logger.info("Exiting %s", self.name)
 

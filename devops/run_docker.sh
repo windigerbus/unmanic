@@ -38,50 +38,26 @@ PROJECT_BASE=$(cd "$SCRIPT_DIR/.." && pwd)
 PUID=$(id -u)
 PGID=$(id -g)
 DEBUG="false"
-USE_CUSTOM_SUPPORT_API=""
-CONFIG_PREFIX=""
+USE_TEST_SUPPORT_API="false"
 CACHE_PATH="$PROJECT_BASE/dev_environment/cache"
 EXT_PORT=8888
 IMAGE_TAG="staging"
 DOCKER_PARAMS=()
-CONTAINER_NAME="unmanic-dev"
-CONFIG_LABEL="com.unmanic.run_config"
-CPUS=""
-MEMORY=""
-FORCE_RECREATE="false"
-COMMAND="run"
-COMMAND_ARGS=()
-EXEC_ROOT="false"
-RUN_COMMAND=""
-ENABLE_PROFILING="false"
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [OPTIONS] [COMMAND] [COMMAND_ARGS...]
+Usage: $(basename "$0") [OPTIONS]
 
 Options:
     --help, -h                  Show this help message and exit
     --debug                     Enable debug mode inside container
-    --support-api=<dev|test>    Set USE_CUSTOM_SUPPORT_API inside container
+    --use-test-support-api      Set USE_TEST_SUPPORT_API=true inside container
     --hw=<nvidia|vaapi>         Enable hardware acceleration
     --cpus=<value>              Limit container CPUs (e.g. "2.5")
     --memory=<value>            Limit container memory (e.g. "4g")
     --cache=<path>              Override cache directory (default: $CACHE_PATH)
-    --config-prefix=<value>     Use dev_environment/config-<value> for /config mount
     --port=<port>               Map host port to container 8888 (default: $EXT_PORT)
     --tag=<image-tag>           Docker image tag to run (default: $IMAGE_TAG)
-    --force-recreate            Recreate container even if settings match
-    --root                      Run exec commands as root (uid 0)
-    --run-cmd=<value>           Override container run command (supports {cmd} placeholder)
-
-Commands:
-    run                         Start the container (default)
-    build                       Build the staging image from ./docker/Dockerfile
-    pull                        Pull the staging image from Docker Hub
-    stop                        Stop the container
-    shell                       Run an interactive shell inside the container
-    exec                        Run a command inside the container
-    logs                        Print container logs (pass extra docker args, e.g. -f)
 EOF
 }
 
@@ -95,25 +71,20 @@ while [[ $# -gt 0 ]]; do
     --debug)
         DEBUG=true
         ;;
-    --support-api=*)
-        USE_CUSTOM_SUPPORT_API="${1#*=}"
+    --use-test-support-api)
+        USE_TEST_SUPPORT_API=true
         ;;
     --hw=*)
         HW="${1#*=}"
         ;;
     --cpus=*)
-        CPUS="${1#*=}"
-        DOCKER_PARAMS+=(--cpus "$CPUS")
+        DOCKER_PARAMS+=(--cpus "${1#*=}")
         ;;
     --memory=*)
-        MEMORY="${1#*=}"
-        DOCKER_PARAMS+=(--memory "$MEMORY")
+        DOCKER_PARAMS+=(--memory "${1#*=}")
         ;;
     --cache=*)
         CACHE_PATH="${1#*=}"
-        ;;
-    --config-prefix=*)
-        CONFIG_PREFIX="${1#*=}"
         ;;
     --port=*)
         EXT_PORT="${1#*=}"
@@ -121,29 +92,10 @@ while [[ $# -gt 0 ]]; do
     --tag=*)
         IMAGE_TAG="${1#*=}"
         ;;
-    --force-recreate)
-        FORCE_RECREATE=true
-        ;;
-    --root)
-        EXEC_ROOT=true
-        ;;
-    --run-cmd=*)
-        RUN_COMMAND="${1#*=}"
-        ;;
-    --profiling)
-        ENABLE_PROFILING=true
-        ;;
-    run | build | pull | stop | shell | exec | logs)
-        COMMAND="$1"
-        shift
-        COMMAND_ARGS=("$@")
-        break
-        ;;
     *)
-        COMMAND="$1"
-        shift
-        COMMAND_ARGS=("$@")
-        break
+        echo "Unknown option: $1" >&2
+        usage
+        exit 1
         ;;
     esac
     shift
@@ -164,17 +116,6 @@ if [[ -n $HW ]]; then
     esac
 fi
 
-if [[ -n $USE_CUSTOM_SUPPORT_API ]]; then
-    case $USE_CUSTOM_SUPPORT_API in
-    dev | test)
-        ;;
-    *)
-        echo "Unsupported --support-api=$USE_CUSTOM_SUPPORT_API (use dev or test)" >&2
-        exit 1
-        ;;
-    esac
-fi
-
 # detect if we need sudo
 if docker ps >/dev/null 2>&1; then
     DOCKER_CMD="docker"
@@ -182,165 +123,21 @@ else
     DOCKER_CMD="sudo docker"
 fi
 
-CONFIG_PATH="$PROJECT_BASE/dev_environment/config"
-if [[ -n $CONFIG_PREFIX ]]; then
-    CONFIG_PATH="$PROJECT_BASE/dev_environment/config-$CONFIG_PREFIX"
-fi
-IMAGE_ID="$($DOCKER_CMD image inspect -f '{{.Id}}' "josh5/unmanic:$IMAGE_TAG" 2>/dev/null || true)"
-config_string="debug=$DEBUG;use_custom_support_api=$USE_CUSTOM_SUPPORT_API;hw=${HW:-};cpus=$CPUS;memory=$MEMORY;cache=$CACHE_PATH;config_path=$CONFIG_PATH;port=$EXT_PORT;tag=$IMAGE_TAG;image_id=$IMAGE_ID;puid=$PUID;pgid=$PGID"
-if [[ -n $RUN_COMMAND ]]; then
-    config_string="${config_string};run_cmd=$RUN_COMMAND"
-fi
-if [[ "$ENABLE_PROFILING" == "true" ]]; then
-    config_string="${config_string};profiling=true"
-fi
-config_hash=$(printf '%s' "$config_string" | sha256sum | awk '{print $1}')
-
-start_container() {
-    local container_id
-    container_id=$($DOCKER_CMD run --rm -d \
-        --name "$CONTAINER_NAME" \
-        --label "$CONFIG_LABEL=$config_hash" \
-        -e TZ=Pacific/Auckland \
-        -e PUID="$PUID" \
-        -e PGID="$PGID" \
-        -e DEBUGGING="$DEBUG" \
-        -e USE_CUSTOM_SUPPORT_API="$USE_CUSTOM_SUPPORT_API" \
-        -e UNMANIC_RUN_COMMAND="$RUN_COMMAND" \
-        -e PROFILE_UNMANIC="$ENABLE_PROFILING" \
-        -p "$EXT_PORT":8888 \
-        -v "$PROJECT_BASE":/app:Z \
-        -v "$CONFIG_PATH":/config:Z \
-        -v "$PROJECT_BASE/dev_environment/library":/library:Z \
-        -v "$CACHE_PATH":/tmp/unmanic:Z \
-        -v "$CACHE_PATH/remote_library":/tmp/unmanic/remote_library:Z \
-        -v /run/user/"$PUID":/run/user:ro,Z \
-        "${DOCKER_PARAMS[@]}" \
-        josh5/unmanic:"$IMAGE_TAG")
-    echo "Started container: ${container_id}"
-    sleep 1
-    if ! container_running; then
-        echo "Warning: $CONTAINER_NAME container exited shortly after start." >&2
-        $DOCKER_CMD logs --tail 200 "$CONTAINER_NAME" || true
-        exit 1
-    fi
-}
-
-print_access_info() {
-    local mapped_port
-    mapped_port=$($DOCKER_CMD port "$CONTAINER_NAME" 8888/tcp 2>/dev/null | head -n 1 | awk -F: '{print $NF}')
-    if [[ -z $mapped_port ]]; then
-        mapped_port="$EXT_PORT"
-    fi
-    echo "Container name: $CONTAINER_NAME"
-    echo "Access Unmanic at http://localhost:${mapped_port}"
-}
-
-ensure_dist_artifacts() {
-    local venv_python
-    if [[ -d "$PROJECT_BASE/dist" ]] && ls "$PROJECT_BASE"/dist/* >/dev/null 2>&1; then
-        return 0
-    fi
-
-    echo "--- Building Unmanic package artifacts (dist/) ---"
-    venv_python="$PROJECT_BASE/venv/bin/python3"
-    if [[ ! -x "$venv_python" ]]; then
-        echo "--- Creating venv at $PROJECT_BASE/venv ---"
-        python3 -m venv "$PROJECT_BASE/venv"
-    fi
-
-    echo "--- Ensuring venv dependencies ---"
-    "$venv_python" -m pip install -U pip setuptools wheel
-    "$venv_python" -m pip install -U -r "$PROJECT_BASE/requirements.txt" -r "$PROJECT_BASE/requirements-dev.txt"
-
-    rm -rf "$PROJECT_BASE/build"
-    rm -f "$PROJECT_BASE"/dist/unmanic-*
-    git submodule update --init --recursive
-    "$venv_python" -m build --no-isolation --skip-dependency-check --wheel
-    "$venv_python" -m build --no-isolation --skip-dependency-check --sdist
-}
-
-container_exists() {
-    $DOCKER_CMD inspect "$CONTAINER_NAME" >/dev/null 2>&1
-}
-
-container_running() {
-    $DOCKER_CMD inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null | grep -q true
-}
-
-existing_hash="$($DOCKER_CMD inspect -f "{{ index .Config.Labels \"$CONFIG_LABEL\" }}" "$CONTAINER_NAME" 2>/dev/null || true)"
-
-warn_container_state() {
-    if ! container_exists; then
-        echo "Warning: $CONTAINER_NAME container has not been created. Start it first with '$(basename "$0") run'." >&2
-        exit 1
-    fi
-    if ! container_running; then
-        echo "Warning: $CONTAINER_NAME container is not running. Start it first with '$(basename "$0") run'." >&2
-        exit 1
-    fi
-}
-
-case "$COMMAND" in
-run)
-    if container_exists; then
-        if [[ "$FORCE_RECREATE" == "true" ]] || [[ "$existing_hash" != "$config_hash" ]] || ! container_running; then
-            echo "Recreating $CONTAINER_NAME container with updated settings..."
-            $DOCKER_CMD rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-            start_container
-        else
-            echo "$CONTAINER_NAME container already running with matching settings."
-        fi
-    else
-        start_container
-    fi
-    print_access_info
-    ;;
-build)
-    ensure_dist_artifacts
-    $DOCKER_CMD build -f "$PROJECT_BASE/docker/Dockerfile" -t josh5/unmanic:"$IMAGE_TAG" "$PROJECT_BASE"
-    ;;
-pull)
-    $DOCKER_CMD pull josh5/unmanic:"$IMAGE_TAG"
-    ;;
-stop)
-    if container_exists; then
-        if container_running; then
-            $DOCKER_CMD stop "$CONTAINER_NAME"
-        else
-            echo "Warning: $CONTAINER_NAME container is already stopped." >&2
-        fi
-    else
-        echo "Warning: $CONTAINER_NAME container has not been created." >&2
-    fi
-    ;;
-shell)
-    warn_container_state
-    $DOCKER_CMD exec -it "$CONTAINER_NAME" bash
-    ;;
-exec)
-    warn_container_state
-    if [[ ${#COMMAND_ARGS[@]} -eq 0 ]]; then
-        echo "Error: exec requires a command to run inside the container." >&2
-        usage
-        exit 1
-    fi
-    if [[ "$EXEC_ROOT" == "true" ]]; then
-        $DOCKER_CMD exec -it --user 0:0 "$CONTAINER_NAME" "${COMMAND_ARGS[@]}"
-    else
-        $DOCKER_CMD exec -it --user "$PUID:$PGID" "$CONTAINER_NAME" "${COMMAND_ARGS[@]}"
-    fi
-    ;;
-logs)
-    if ! container_exists; then
-        echo "Warning: $CONTAINER_NAME container has not been created. Start it first with '$(basename "$0") run'." >&2
-        exit 1
-    fi
-    $DOCKER_CMD logs "${COMMAND_ARGS[@]}" "$CONTAINER_NAME"
-    ;;
-*)
-    echo "Unknown command: $COMMAND" >&2
-    usage
-    exit 1
-    ;;
-esac
+# run!
+$DOCKER_CMD run --rm -it \
+    --name unmanic \
+    -e TZ=Pacific/Auckland \
+    -e PUID="$PUID" \
+    -e PGID="$PGID" \
+    -e DEBUGGING="$DEBUG" \
+    -e USE_TEST_SUPPORT_API="$USE_TEST_SUPPORT_API" \
+    -p "$EXT_PORT":8888 \
+    -v "$PROJECT_BASE":/app:Z \
+    -v "$PROJECT_BASE/dev_environment/config":/config:Z \
+    -v "$PROJECT_BASE/dev_environment/library":/library:Z \
+    -v "$CACHE_PATH":/tmp/unmanic:Z \
+    -v "$CACHE_PATH/remote_library":/tmp/unmanic/remote_library:Z \
+    -v /run/user/"$PUID":/run/user:ro,Z \
+    "${DOCKER_PARAMS[@]}" \
+    ghcr.io/unmanic/unmanic:"$IMAGE_TAG" \
+    bash

@@ -37,12 +37,10 @@ import importlib.util
 import importlib
 import sys
 
-from unmanic import config
 from . import plugin_types
 from unmanic.libs import common
 from ..logs import UnmanicLogging
 from ..task import TaskDataStore
-from unmanic.libs.metadata import UnmanicFileMetadata
 
 
 class PluginExecutor(object):
@@ -114,7 +112,6 @@ class PluginExecutor(object):
             },
         ]
         self.logger = UnmanicLogging.get_logger(name=__class__.__name__)
-        self.settings = config.Config()
 
     def __get_plugin_directory(self, plugin_id):
         """
@@ -192,23 +189,22 @@ class PluginExecutor(object):
         # self.logger.debug("Reloading module '{}'".format(module_name))
 
         if module_name in sys.modules:
-            # Unload all submodules
-            submodules = []
-            for mn in list(sys.modules):
-                if mn.startswith(plugin_id + ".") and mn != module_name:
-                    submodules.append(mn)
-            for mn in submodules:
-                del sys.modules[mn]
-
-            # Reload the plugin module, it will import its submodules as required.
-            try:
-                importlib.reload(sys.modules[module_name])
-            except ImportError:
-                # The module's parent was probably not imported.
-                # Delete it from sys.modules and carry on.
-                # This will force it to be reloaded again
-                self.logger.exception("Exception encountered while trying to reload module '%s'", module_name)
-                del sys.modules[module_name]
+            # Get all submodules
+            module_names = [module_name]
+            for m in sys.modules:
+                if plugin_id in m and m not in [plugin_id, module_name]:
+                    # Add to removal list
+                    module_names.append(m)
+            # Reload all imported modules or remove them if that fails
+            for mn in module_names:
+                try:
+                    importlib.reload(sys.modules[mn])
+                except ImportError:
+                    # The module's parent was probably not imported.
+                    # Delete it from sys.modules and carry on.
+                    # This will force it to be reloaded again
+                    self.logger.exception("Exception encountered while trying to reload module '%s'", module_name)
+                    del sys.modules[module_name]
 
     @staticmethod
     def unload_plugin_module(plugin_id):
@@ -221,15 +217,11 @@ class PluginExecutor(object):
         :param plugin_id:
         :return:
         """
-        module_names = []
-        plugin_module_name = '{}.plugin'.format(plugin_id)
+        # Set the module name
+        module_name = '{}.plugin'.format(plugin_id)
 
-        for mn in list(sys.modules):
-            if mn == plugin_id or mn == plugin_module_name or mn.startswith(plugin_id + "."):
-                module_names.append(mn)
-
-        for mn in module_names:
-            del sys.modules[mn]
+        if module_name in sys.modules:
+            del sys.modules[module_name]
 
     @staticmethod
     def get_plugin_type_meta(plugin_type):
@@ -300,66 +292,18 @@ class PluginExecutor(object):
                     runner=plugin_runner,
                 )
 
-            metadata_path = data.get("path") or data.get("file_path")
-            UnmanicFileMetadata.bind_runner_context(
-                plugin_id=plugin_id,
-                task_id=task_id,
-                path=metadata_path,
-            )
-
             sig = inspect.signature(runner)
-            params = sig.parameters
-
-            def supports_kwarg(name):
-                if name in params:
-                    return True
-                for param in params.values():
-                    if param.kind == inspect.Parameter.VAR_KEYWORD:
-                        return True
-                return False
-
-            def has_required_positional_after_data():
-                positional = []
-                for param in params.values():
-                    if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
-                        positional.append(param)
-                # First positional is expected to be `data`
-                remaining = positional[1:]
-                for param in remaining:
-                    if param.default is inspect._empty:
-                        return True
-                return False
-
-            kwargs = {}
-            if supports_kwarg("task_data_store"):
-                kwargs["task_data_store"] = TaskDataStore
-            if supports_kwarg("file_metadata"):
-                kwargs["file_metadata"] = UnmanicFileMetadata
-
-            if kwargs and not has_required_positional_after_data():
-                runner(data, **kwargs)
+            # if runner declares two parameters, pass the store class as second arg
+            if len(sig.parameters) >= 2:
+                runner(data, TaskDataStore)
             else:
-                # Backward compatibility: positional helpers (legacy; will be removed in a future release)
-                if self.settings.get_debugging():
-                    self.logger.warning(
-                        "Plugin '%s' runner '%s' is using legacy positional helper args. "
-                        "Please update to keyword args (task_data_store, file_metadata).",
-                        plugin_id,
-                        plugin_runner,
-                    )
-                if len(params) >= 3:
-                    runner(data, TaskDataStore, UnmanicFileMetadata)
-                elif len(params) >= 2:
-                    runner(data, TaskDataStore)
-                else:
-                    runner(data)
+                runner(data)
 
             run_successfully = True
         except Exception:
             self.logger.exception("Exception while carrying out '%s' plugin runner '%s'", plugin_type, plugin_id)
         finally:
             TaskDataStore.clear_context()
-            UnmanicFileMetadata.clear_context()
 
         return run_successfully
 
@@ -460,9 +404,8 @@ class PluginExecutor(object):
             # Settings plugin_settings
             plugin_settings = plugin_module.Settings(library_id=library_id)
 
-            # Build form first so any in-memory defaults are applied without persisting
-            plugin_form_settings = copy.deepcopy(plugin_settings.get_form_settings())
             all_plugin_settings = copy.deepcopy(plugin_settings.get_setting())
+            plugin_form_settings = copy.deepcopy(plugin_settings.get_form_settings())
         except Exception as e:
             self.logger.exception("Exception while fetching settings for plugin '%s' %s", plugin_id, e)
             all_plugin_settings = {}
@@ -504,8 +447,7 @@ class PluginExecutor(object):
                 req_lev = plugin_setting_meta.get('req_lev', 0)
                 if s.level < req_lev:
                     # Set default
-                    self.logger.debug(
-                        "Option '%s' is reserved for supporters of the project. Resetting to default.", key)
+                    self.logger.debug("Option '%s' is reserved for supporters of the project. Resetting to default.", key)
                     value = plugin_settings.get_default_setting(key)
                 if not plugin_settings.set_setting(key, value):
                     save_result = False

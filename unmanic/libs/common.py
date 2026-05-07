@@ -36,7 +36,6 @@ import os
 import random
 import string
 import shutil
-import xxhash
 
 
 def get_home_dir():
@@ -216,6 +215,7 @@ def json_dump_to_file(json_data, out_file, check=True, rollback_on_fail=True):
     }
 
     # If check param is flagged and there already exists a out file, create a temporary backup
+
     if rollback_on_fail and os.path.exists(out_file):
         temp_dir = tempfile.gettempdir()
         temp_path = os.path.join(temp_dir, 'json_dump_to_file_backup-{}'.format(time.time()))
@@ -239,27 +239,21 @@ def json_dump_to_file(json_data, out_file, check=True, rollback_on_fail=True):
     if check:
         try:
             with open(out_file) as infile:
-                json_data = json.load(infile)
+                data = json.load(infile)
         except Exception as e:
             result['success'] = False
             result['errors'].append("JSON file invalid - {}".format(e))
 
-    # If data save was unsuccessful and the rollback_on_fail param is flagged and there
-    #   is a temp file set, roll back to old file. Otherwise, just delete the temp file.
-    if rollback_on_fail and result.get('temp_path'):
-        if not result.get('success'):
-            try:
-                os.remove(out_file)
-                shutil.copy2(result.get('temp_path'), out_file)
-                os.remove(result.get('temp_path'))
-            except Exception as e:
-                result['success'] = False
-                result['errors'].append("Exception while restoring original file file: {}".format(str(e)))
-        else:
-            try:
-                os.remove(result.get('temp_path'))
-            except Exception as e:
-                pass
+    # If data save was unsuccessful and the rollback_on_fail param is flagged
+    #   and there is a temp file set, roll back to old file
+    if not result.get('success') and result.get('temp_path') and rollback_on_fail:
+        try:
+            os.remove(out_file)
+            shutil.copy2(result.get('temp_path'), out_file)
+            os.remove(result.get('temp_path'))
+        except Exception as e:
+            result['success'] = False
+            result['errors'].append("Exception while restoring original file file: {}".format(str(e)))
 
     return result
 
@@ -294,94 +288,3 @@ def get_file_checksum(path):
         for chunk in iter(lambda: f.read(8192), b''):
             file_hash.update(chunk)
     return copy.copy(file_hash.hexdigest())
-
-
-def get_file_fingerprint(path, algo="sampled_xxhash_v1"):
-    """
-    Create a content-based fingerprint for a file.
-
-    Returns a tuple: (fingerprint, algo_used)
-
-    Supported algos:
-        - "sampled_sha256_v1"
-        - "full_sha256_v1"
-        - "sampled_xxhash_v1"
-        - "full_xxhash_v1"
-
-    :param path:
-    :param algo:
-    :return:
-    """
-    algos = {
-        "sampled_sha256_v1": {
-            "sample_size":     8 * 1024 * 1024,
-            "sample_count":    10,
-            "full_hash_limit": 100 * 1024 * 1024,
-            "fallback_algo":   "full_sha256_v1",
-        },
-        "full_sha256_v1": {
-            "sample_size":     None,
-            "sample_count":    None,
-            "full_hash_limit": 0,
-        },
-        "sampled_xxhash_v1": {
-            "sample_size":     8 * 1024 * 1024,
-            "sample_count":    10,
-            "full_hash_limit": 100 * 1024 * 1024,
-            "fallback_algo":   "full_xxhash_v1",
-        },
-        "full_xxhash_v1": {
-            "sample_size":     None,
-            "sample_count":    None,
-            "full_hash_limit": 0,
-        },
-    }
-
-    if algo not in algos:
-        algo = "sampled_xxhash_v1"
-
-    file_size = os.path.getsize(path)
-
-    actual_algo_to_use = algo
-
-    if algo in ["sampled_sha256_v1", "sampled_xxhash_v1"]:
-        if file_size <= algos[algo]["full_hash_limit"]:
-            actual_algo_to_use = algos[algo]["fallback_algo"]
-
-    if actual_algo_to_use in ["full_xxhash_v1", "sampled_xxhash_v1"]:
-        file_hash_obj = xxhash.xxh64()
-    else:
-        file_hash_obj = hashlib.sha256()
-
-    file_hash_obj.update(str(file_size).encode('utf-8'))
-
-    perform_full_hash = False
-    if actual_algo_to_use in ["full_sha256_v1", "full_xxhash_v1"]:
-        perform_full_hash = True
-
-    if perform_full_hash:
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b''):
-                file_hash_obj.update(chunk)
-        return file_hash_obj.hexdigest(), actual_algo_to_use
-
-    sample_size = algos[actual_algo_to_use]["sample_size"]
-    sample_count = algos[actual_algo_to_use]["sample_count"]
-    max_offset = max(0, file_size - sample_size)
-    if sample_count < 2:
-        sample_count = 2
-
-    # Generate evenly spaced offsets including first and last positions.
-    offsets = []
-    for i in range(sample_count):
-        offset = int((max_offset * i) / (sample_count - 1))
-        offsets.append(offset)
-
-    # De-duplicate offsets for small-ish files and read samples.
-    offsets = sorted(set(offsets))
-    with open(path, "rb") as f:
-        for offset in offsets:
-            f.seek(offset)
-            file_hash_obj.update(f.read(sample_size))
-
-    return file_hash_obj.hexdigest(), actual_algo_to_use

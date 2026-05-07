@@ -29,10 +29,10 @@
            OR OTHER DEALINGS IN THE SOFTWARE.
 
 """
-import queue
 import signal
-import threading
 import time
+import queue
+import threading
 
 import psutil
 
@@ -43,78 +43,6 @@ _shared_manager = None
 
 _active_plugin_pids = set()
 _active_lock = threading.Lock()
-
-
-def _collect_process_tree(root_proc: psutil.Process):
-    try:
-        root_proc = psutil.Process(root_proc.pid)
-    except psutil.NoSuchProcess:
-        return []
-
-    process_tree = []
-    pending = [root_proc]
-    seen_pids = set()
-
-    while pending:
-        proc = pending.pop()
-        if proc.pid in seen_pids:
-            continue
-        seen_pids.add(proc.pid)
-        process_tree.append(proc)
-        try:
-            pending.extend(proc.children())
-        except psutil.NoSuchProcess:
-            continue
-
-    return process_tree
-
-
-def _terminate_process_tree(root_proc: psutil.Process, logger=None, term_timeout=3, kill_timeout=3):
-    """
-    Terminate a process tree, repeatedly rescanning for newly spawned descendants
-    until the root process is gone. This prevents descendants from escaping when a
-    parent handles SIGTERM by briefly continuing execution and spawning more work.
-    """
-    term_deadline = time.time() + term_timeout
-    kill_deadline = term_deadline + kill_timeout
-
-    while True:
-        process_tree = _collect_process_tree(root_proc)
-        if not process_tree:
-            return
-
-        now = time.time()
-        should_kill = now >= term_deadline
-
-        for proc in process_tree:
-            try:
-                proc.send_signal(signal.SIGCONT)
-            except Exception:
-                pass
-            try:
-                proc.resume()
-            except Exception:
-                pass
-
-        for proc in process_tree:
-            try:
-                if should_kill:
-                    proc.kill()
-                else:
-                    proc.terminate()
-            except psutil.NoSuchProcess:
-                continue
-
-        if should_kill:
-            _, alive = psutil.wait_procs(process_tree, timeout=0.3)
-            if not alive:
-                return
-            if time.time() >= kill_deadline:
-                if logger:
-                    logger.warning("Timed out waiting for process tree rooted at PID %s to exit", root_proc.pid)
-                return
-        else:
-            psutil.wait_procs(process_tree, timeout=0.3)
 
 
 def _register_pid(pid: int):
@@ -142,7 +70,38 @@ def kill_all_plugin_processes():
             root = psutil.Process(pid)
         except psutil.NoSuchProcess:
             continue
-        _terminate_process_tree(root)
+
+        procs = root.children(recursive=True) + [root]
+
+        # Ensure no processes are left in SIGSTOP
+        for p in procs:
+            try:
+                # on Unix, unblock with SIGCONT
+                p.send_signal(signal.SIGCONT)
+            except Exception:
+                pass
+            try:
+                # on all platforms psutil.resume() works if supported
+                p.resume()
+            except Exception:
+                pass
+
+        # Attempt graceful shutdown
+        for p in procs:
+            try:
+                p.terminate()
+            except psutil.NoSuchProcess:
+                pass
+
+        gone, alive = psutil.wait_procs(procs, timeout=3)
+
+        # Finally, force kill any stragglers
+        for p in alive:
+            try:
+                p.kill()
+            except psutil.NoSuchProcess:
+                pass
+        psutil.wait_procs(alive, timeout=3)
 
 
 def set_shared_manager(mgr):
@@ -157,7 +116,6 @@ class PluginChildProcess:
         data must include:
           - data['worker_log']              : list to which your child functions logs go
           - data['command_progress_parser'] : callable(line_text, pid=None, proc_start_time=None, unset=False)
-          - data['current_command']         : list used to share a "current command" string with the UI
         """
         self.logger = UnmanicLogging.get_logger(
             name=f'Plugin.{plugin_id}.{__class__.__name__}'
@@ -171,32 +129,13 @@ class PluginChildProcess:
         self._proc = None
         self._term_lock = threading.Lock()
 
-    def _set_current_command(self, command):
-        current_command = self.data.get('current_command')
-        if not isinstance(current_command, list):
-            return
-        current_command.clear()
-        current_command.append(command)
-
-    def _clear_current_command(self):
-        current_command = self.data.get('current_command')
-        if not isinstance(current_command, list):
-            return
-        current_command.clear()
-
     def run(self, target, *args, **kwargs):
         """
-        Launch `target(*args, **kwargs)` in its own process after injecting
-        `log_queue` and `prog_queue` into the keyword arguments.
-        Your `target` should accept two extra optional keyword args:
+        Launch `target(*args, **kwargs, log_queue, prog_queue)` in its own process.
+        Your `target` should accept two extra keyword args:
           log_queue  –> use log_queue.put(str) to emit log lines
           prog_queue –> use prog_queue.put(percentage:float) to emit progress
         """
-        if isinstance(self.data.get('current_command'), list):
-            current_command = self.data.get('current_command')
-            if not current_command or not current_command[-1]:
-                target_name = getattr(target, "__name__", "child_process")
-                self._set_current_command(f"PluginChildProcess: {target_name}")
         # Start child as before
         from multiprocessing import Process
         self._proc = Process(
@@ -205,8 +144,7 @@ class PluginChildProcess:
             daemon=True
         )
         self._proc.start()
-        if self._proc.pid is not None:
-            _register_pid(self._proc.pid)
+        _register_pid(self._proc.pid)
         self.logger.info("Started child PID %s", self._proc.pid)
 
         # Register PID & start time with WorkerSubprocessMonitor
@@ -221,9 +159,7 @@ class PluginChildProcess:
         success = self._monitor()
 
         # When the child process is done, unregister
-        if self._proc.pid is not None:
-            _unregister_pid(self._proc.pid)
-        self._clear_current_command()
+        _unregister_pid(self._proc.pid)
 
         # Return success status
         return success
@@ -239,7 +175,6 @@ class PluginChildProcess:
             target(*args, **kwargs)
         except Exception:
             self.logger.exception("Exception in child target")
-            raise
 
     def _monitor(self):
         """
@@ -268,7 +203,7 @@ class PluginChildProcess:
                 pass
 
             # 3) if the child exited, we’re done. Unset parser PID
-            if self._proc is not None and not self._proc.is_alive():
+            if not self._proc.is_alive():
                 exit_ok = (self._proc.exitcode == 0)
                 if callable(parser):
                     # tell parser to unset its internal proc state

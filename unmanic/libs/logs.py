@@ -36,7 +36,7 @@ import threading
 import json
 import time
 from logging.handlers import RotatingFileHandler
-from queue import Queue, Empty, Full
+from queue import Queue, Empty
 import requests
 from datetime import datetime, timedelta
 from json_log_formatter import JSONFormatter
@@ -109,8 +109,8 @@ class ForwardLogHandler(logging.Handler):
         self._buffer_state_path = os.path.join(self.buffer_path, self.STATE_FILENAME)
         self._buffer_state = self._load_buffer_state()
 
-        self._in_memory_chunks = Queue(maxsize=1000)
-        self.log_queue = Queue(maxsize=10000)
+        self._in_memory_chunks = Queue()
+        self.log_queue = Queue()
         self.stop_event = threading.Event()
 
         self._last_cleanup = time.monotonic()
@@ -155,10 +155,6 @@ class ForwardLogHandler(logging.Handler):
     def emit(self, record):
         """Format a record and enqueue it for asynchronous handling."""
         try:
-            # If retention is disabled and there is no remote endpoint configured, discard
-            if self._retention_disabled and not (self.endpoint and self.app_id):
-                return
-
             log_entry = self.format(record)
 
             # Set log timestamp in nanoseconds
@@ -187,14 +183,10 @@ class ForwardLogHandler(logging.Handler):
             if hasattr(record, "data_primary_key") and record.data_primary_key:
                 labels["data_primary_key"] = record.data_primary_key
 
-            try:
-                self.log_queue.put_nowait({
-                    "labels": labels,
-                    "entry":  [ts, log_entry]
-                })
-            except Full:
-                # Discard log if queue is full
-                pass
+            self.log_queue.put({
+                "labels": labels,
+                "entry":  [ts, log_entry]
+            })
         except Exception as e:
             logging.getLogger("Unmanic.ForwardLogHandler").error("Failed to enqueue log: %s", e)
 
@@ -231,21 +223,7 @@ class ForwardLogHandler(logging.Handler):
         if not batch:
             return
         if self._retention_disabled:
-            # If retention is disabled and there is no remote endpoint configured, discard
-            if not (self.endpoint and self.app_id):
-                return
-            try:
-                self._in_memory_chunks.put_nowait(list(batch))
-            except Empty:
-                # This should not happen
-                pass
-            except Exception:
-                # Drop oldest item
-                try:
-                    self._in_memory_chunks.get_nowait()
-                    self._in_memory_chunks.put_nowait(list(batch))
-                except (Empty, Exception):
-                    pass
+            self._in_memory_chunks.put(list(batch))
             return
         self._append_to_disk(batch)
 
@@ -457,8 +435,6 @@ class ForwardLogHandler(logging.Handler):
             for legacy_name in os.listdir(self.buffer_path):
                 if not legacy_name.endswith(".json"):
                     continue
-                if legacy_name == self.STATE_FILENAME:
-                    continue
                 legacy_path = os.path.join(self.buffer_path, legacy_name)
                 try:
                     os.remove(legacy_path)
@@ -491,16 +467,15 @@ class ForwardLogHandler(logging.Handler):
                     break
 
                 if not (self.endpoint and self.app_id):
-                    # Discard if no remote endpoint is configured
+                    remaining = chunk[index:]
+                    if remaining:
+                        self._in_memory_chunks.put(list(remaining))
                     return processed
 
                 if not self._transmit_buffer(sub_entries, "in-memory chunk", payload):
                     remaining = list(sub_entries) + chunk[index + consumed:]
                     if remaining:
-                        try:
-                            self._in_memory_chunks.put_nowait(list(remaining))
-                        except (Empty, Exception):
-                            pass
+                        self._in_memory_chunks.put(list(remaining))
                     return processed
 
                 processed = True

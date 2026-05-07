@@ -8,8 +8,6 @@ dev_environment/**
 tests/support_/videos/*
 tests/tmp/*
 tests/.vstats_file
-/temp
-/tmp
 
 # Files needed for development only
 venv/**

@@ -1,5 +1,6 @@
-FROM ubuntu:24.04
+FROM lsiobase/ubuntu:jammy
 LABEL maintainer="Josh.5 <jsunnex@gmail.com>"
+
 
 # Env variables
 ENV \
@@ -9,52 +10,17 @@ ENV \
 
 
 # Install the runtime dependencies
+# TODO: Remove intel-opencl-icd and replace with suggested build by Jellyfin
+#   https://jellyfin.org/docs/general/administration/hardware-acceleration.html
+#   https://github.com/jellyfin/jellyfin/blob/master/Dockerfile
 RUN \
-    echo "**** Configure APT ****" \
-        && export DEBIAN_FRONTEND=noninteractive \
-    && \
     echo "**** Install build dependencies requirements ****" \
         && apt-get update \
         && apt-get install -y \
-            autoconf \
-            automake \
-            build-essential \
             ca-certificates \
-            cmake \
             curl \
-            g++ \
-            git \
             gnupg \
-            gosu \
-            gzip \
-            libaom-dev \
-            libass-dev \
-            libdav1d-dev \
-            libdrm-dev \
-            libfdk-aac-dev \
-            libfontconfig1-dev \
-            libfreetype6-dev \
-            libmp3lame-dev \
-            libnuma-dev \
-            libopus-dev \
-            libssl-dev \
-            libsvtav1-dev \
-            libtool \
-            libv4l-dev \
-            libva-dev \
-            libvorbis-dev \
-            libvpx-dev \
-            libx264-dev \
-            libx265-dev \
-            make \
-            meson \
-            nasm \
-            ninja-build \
-            pkg-config \
-            tar \
             wget \
-            xz-utils \
-            yasm \
     && \
     echo "**** Install runtime packages ****" \
         && apt-get install -y \
@@ -69,7 +35,7 @@ RUN \
             libxext6 \
             libxml2 \
     && \
-    echo "**** Install all available Video Acceleration API packages ****" \
+    echo "**** Install all available media acceleration packages ****" \
         # va-driver-all: 
         #   A meta-package for installing all available Video Acceleration API (VAAPI) drivers. Includes packages like:
         #       - i965-va-driver
@@ -79,12 +45,6 @@ RUN \
         #       - etc
         && apt-get install -y \
             va-driver-all \
-    && \
-    echo "**** Install all available Vulkan API packages ****" \
-        && apt-get install -y \
-            libvulkan1 \
-            mesa-vulkan-drivers \
-            vulkan-tools \
     && \
     echo "**** Install arch specific packages for $(uname -m) ****" \
         && sleep 2 \
@@ -106,8 +66,6 @@ RUN \
                 #   Similar to libmfx1, it's a part of the Intel Media SDK.
                 # libva-drm2 and libva2:
                 #   These are additional libraries needed for VAAPI to interface with the Direct Rendering Manager (DRM) and to provide the main API for VAAPI.
-                # libvpl-dev:
-                #   Development headers required when building the custom FFmpeg inside the container. On Ubuntu 24.04 this dev package is available for x86, but not arm64.
                 # libvpl2:
                 #   This is the successor to the Media SDK and provides a library for video processing.
                 && apt-get install -y \
@@ -117,7 +75,6 @@ RUN \
                     libmfxgen1 \
                     libva-drm2 \
                     libva2 \
-                    libvpl-dev \
                     libvpl2 \
             && \
             echo ; \
@@ -140,17 +97,11 @@ RUN \
             /var/tmp/* \
             /tmp/*
 
+
 # Install commonly used command line tools
-ARG JELLYFIN_FFMPEG_VERSION="7"
-ARG BTBN_FFMPEG_RELEASE="autobuild-2026-03-19-13-03"
-ARG BTBN_FFMPEG_VERSION="8.0"
-ARG NODE_MAJOR="22"
+ARG JELLYFIN_FFMPEG_VERSION="6"
+ARG NODE_MAJOR="20"
 RUN \
-    echo "**** Configure APT ****" \
-        && export DEBIAN_FRONTEND=noninteractive \
-        && . /etc/os-release \
-        && JELLYFIN_CODENAME="${VERSION_CODENAME:-noble}" \
-    && \
     echo "**** Install FFmpeg for $(uname -m) ****" \
         && sleep 2 \
         && apt-get update \
@@ -158,7 +109,7 @@ RUN \
         if uname -m | grep -q x86; then \
             echo "**** Add Jellyfin repository ****" \
                 && wget -qO - https://repo.jellyfin.org/jellyfin_team.gpg.key | gpg --dearmor --output /usr/share/keyrings/jellyfin_team.gpg \
-                && echo "deb [arch=$( dpkg --print-architecture ) signed-by=/usr/share/keyrings/jellyfin_team.gpg] https://repo.jellyfin.org/ubuntu ${JELLYFIN_CODENAME} main" | tee /etc/apt/sources.list.d/jellyfin.list \
+                && echo "deb [arch=$( dpkg --print-architecture ) signed-by=/usr/share/keyrings/jellyfin_team.gpg] https://repo.jellyfin.org/ubuntu jammy main" | tee /etc/apt/sources.list.d/jellyfin.list \
             && \
             echo "**** Install jellyfin-ffmpeg and linked 3rd party libs ****" \
                 && apt-get update \
@@ -170,21 +121,13 @@ RUN \
                 && ln -s /usr/lib/jellyfin-ffmpeg/ffmpeg /usr/local/bin/ffmpeg \
                 && ln -s /usr/lib/jellyfin-ffmpeg/ffprobe /usr/local/bin/ffprobe \
             && \
-            echo "**** Install BtbN FFmpeg GPL build ****" \
-                && mkdir -p /usr/lib/btbn-ffmpeg \
-                && BTBN_FFMPEG_ASSET_URL="$(curl -fsSL "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/${BTBN_FFMPEG_RELEASE}" | grep -oE "https://[^[:space:]\\\"]*ffmpeg-n${BTBN_FFMPEG_VERSION}[^[:space:]\\\"]*-linux64-gpl-${BTBN_FFMPEG_VERSION}\\.tar\\.xz" | head -n1)" \
-                && test -n "${BTBN_FFMPEG_ASSET_URL}" \
-                && wget -qO /tmp/btbn-ffmpeg.tar.xz "${BTBN_FFMPEG_ASSET_URL}" \
-                && tar -xJf /tmp/btbn-ffmpeg.tar.xz -C /usr/lib/btbn-ffmpeg --strip-components=1 \
-                && rm -f /tmp/btbn-ffmpeg.tar.xz \
-            && \
             echo ; \
         fi \
         && \
         if uname -m | grep -q aarch64; then \
             echo "**** Add Jellyfin repository ****" \
                 && wget -qO - https://repo.jellyfin.org/jellyfin_team.gpg.key | gpg --dearmor --output /usr/share/keyrings/jellyfin_team.gpg \
-                && echo "deb [arch=$( dpkg --print-architecture ) signed-by=/usr/share/keyrings/jellyfin_team.gpg] https://repo.jellyfin.org/ubuntu ${JELLYFIN_CODENAME} main" | tee /etc/apt/sources.list.d/jellyfin.list \
+                && echo "deb [arch=$( dpkg --print-architecture ) signed-by=/usr/share/keyrings/jellyfin_team.gpg] https://repo.jellyfin.org/ubuntu jammy main" | tee /etc/apt/sources.list.d/jellyfin.list \
             && \
             echo "**** Install jellyfin-ffmpeg and linked 3rd party libs ****" \
                 && apt-get update \
@@ -200,20 +143,11 @@ RUN \
                 && ln -s /usr/lib/jellyfin-ffmpeg/ffmpeg /usr/local/bin/ffmpeg \
                 && ln -s /usr/lib/jellyfin-ffmpeg/ffprobe /usr/local/bin/ffprobe \
             && \
-            echo "**** Install BtbN FFmpeg GPL build ****" \
-                && mkdir -p /usr/lib/btbn-ffmpeg \
-                && BTBN_FFMPEG_ASSET_URL="$(curl -fsSL "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/${BTBN_FFMPEG_RELEASE}" | grep -oE "https://[^[:space:]\\\"]*ffmpeg-n${BTBN_FFMPEG_VERSION}[^[:space:]\\\"]*-linuxarm64-gpl-${BTBN_FFMPEG_VERSION}\\.tar\\.xz" | head -n1)" \
-                && test -n "${BTBN_FFMPEG_ASSET_URL}" \
-                && wget -qO /tmp/btbn-ffmpeg.tar.xz "${BTBN_FFMPEG_ASSET_URL}" \
-                && tar -xJf /tmp/btbn-ffmpeg.tar.xz -C /usr/lib/btbn-ffmpeg --strip-components=1 \
-                && rm -f /tmp/btbn-ffmpeg.tar.xz \
-            && \
             echo ; \
         fi \
     && \
     echo "**** Install startup script requirements ****" \
         && apt-get install -y \
-            git \
             jq \
             nano \
             sqlite3 \
@@ -246,9 +180,6 @@ COPY /requirements.txt /tmp/requirements.txt
 
 # Install Unmanic python dependencies.
 RUN \
-    echo "**** Configure APT ****" \
-        && export DEBIAN_FRONTEND=noninteractive \
-    && \
     echo "**** Install Unmanic application dependencies ****" \
         && sleep 2 \
         && \
@@ -262,25 +193,11 @@ RUN \
                 python3 \
                 python3-dev \
                 python3-pip \
-                python3-venv \
                 python3-setuptools \
                 unzip \
         && \
-        echo "**** Create virtual environment ****" \
-            && python3 -m venv /opt/venv \
-        && \
-        echo "**** Configure pip packages constraint and update python package tools ****" \
-            && mkdir -p /etc/pip \
-            && printf 'setuptools<81\n' > /etc/pip/setuptools-constraint.txt \
-            && printf '[global]\nconstraint=/etc/pip/setuptools-constraint.txt\n' > /etc/pip.conf \
-            && /opt/venv/bin/pip install --no-cache-dir --upgrade \
-                pip \
-                setuptools \
-                uv \
-                wheel \
-        && \
-        echo "**** Install pip packages into virtualenv ****" \
-            && /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt \
+        echo "**** Install pip packages ****" \
+            && python3 -m pip install --no-cache-dir -r /tmp/requirements.txt \
     && \
     echo "**** Section cleanup ****" \
         && apt-get clean autoclean -y \
@@ -291,31 +208,19 @@ RUN \
             /tmp/*
 
 
-# Prepare default home directory for runtime user
-RUN \
-    echo "**** Prepare /config home directory ****" \
-        && mkdir -p \
-            /app \
-            /config \
-            /tmp/unmanic \
-        && chown 1000:1000 \
-            /app \
-            /config \
-            /tmp/unmanic
-ENV HOME_DIR="/config"
-
-
 # Install pre-built Unmanic wheel
 # Must first run `python3 ./setup.py bdist_wheel` on host to build package
 COPY /dist/ /src/
-ENV VIRTUAL_ENV=/opt/venv
 RUN \
     echo "**** Install Unmanic ****" \
         && sleep 2 \
         && \
         echo "**** Install unmanic from pre-built wheel ****" \
             && ls -l /src/ \
-            && "${VIRTUAL_ENV:?}"/bin/pip install --no-cache-dir /src/*.whl \
+            && python3 -m pip install --no-cache-dir /src/*.whl \
+        && \
+        echo "**** Move unmanic executable so we can wrap a bash script around it for developers ****" \
+            && mv -f /usr/local/bin/unmanic /usr/local/bin/unmanic-service \
         && \
         echo "**** Make default paths for unmanic library ****" \
             && mkdir -p /library
@@ -324,8 +229,6 @@ RUN \
 # Add local files
 COPY /docker/root /
 
-ENTRYPOINT ["/entrypoint.sh"]
-CMD ["/usr/bin/unmanic"]
 
 # Unmanic runs on port 8888
 EXPOSE 8888/tcp

@@ -44,7 +44,6 @@ class ProcessItem(PluginType):
         worker_log              - Array, the log lines that are being tailed by the frontend. Can be left empty.
         library_id              - Number, the library that the current task is associated with.
         exec_command            - Array, a subprocess command that Unmanic should execute. Can be empty.
-        current_command         - Array, shared list for updating the worker's "current command" text in the UI (last entry wins).
         command_progress_parser - Function, a function that Unmanic can use to parse the STDOUT of the command to collect progress stats. Can be empty.
         file_in                 - String, the source file to be processed by the command.
         file_out                - String, the destination that the command should output (may be the same as the file_in if necessary).
@@ -68,16 +67,12 @@ class ProcessItem(PluginType):
     **Spawning your own child process**  
     Instead of setting `exec_command`, you can perform complex or Python‐only work in a separate process while still reporting logs & progress:
 
-        import time
-
         from unmanic.libs.unplugins.child_process import PluginChildProcess
 
         proc = PluginChildProcess(plugin_id="<your_plugin_id>", data=data)
 
-        def child_work(source_path, log_queue=None, prog_queue=None):
-            # PluginChildProcess injects log_queue and prog_queue as keyword args.
-            # any positional args should be passed to proc.run(...) first
-            log_queue.put(f"Starting work for {source_path}")
+        def child_work(log_queue, prog_queue):
+            # any Python code here
             for i in range(10):
                 # emit a UI log line:
                 log_queue.put(f"step {i}/10 completed")
@@ -86,15 +81,14 @@ class ProcessItem(PluginType):
                 time.sleep(1)
 
         # Runs child_work in its own process, returns True if exit code==0
-        success = proc.run(child_work, data["file_in"])
+        success = proc.run(child_work)
 
     In this mode the `PluginChildProcess` helper:
       1. Spawns the child via `multiprocessing.Process`.  
-      2. Calls your target with `target(*args, **kwargs)` after injecting `log_queue` and `prog_queue` into the keyword arguments.  
-      3. Registers its PID & start‐time with the worker’s `default_progress_parser`.  
-      4. Drains `log_queue` → `data["worker_log"]` for UI tail.  
-      5. Drains `prog_queue` → `command_progress_parser(line_text)` to update the progress bar.  
-      6. Will unset the child process PID on exit to reset all tracked subprocess metrics in the Unmanic Worker (CPU, memory, progress, etc.).
+      2. Registers its PID & start‐time with the worker’s `default_progress_parser`.  
+      3. Drains `log_queue` → `data["worker_log"]` for UI tail.  
+      4. Drains `prog_queue` → `command_progress_parser(line_text)` to update the progress bar.  
+      5. Will unset the child process PID on exit to reset all tracked subprocess metrics in the Unmanic Worker (CPU, memory, progress, etc.).
 
     :param data:
     :return:
@@ -115,10 +109,6 @@ class ProcessItem(PluginType):
         "exec_command":            {
             "required": True,
             "type":     [list, str],
-        },
-        "current_command":         {
-            "required": True,
-            "type":     list,
         },
         "command_progress_parser": {
             "required": True,
@@ -146,7 +136,6 @@ class ProcessItem(PluginType):
         "task_id":                 4321,
         'worker_log':              [],
         'exec_command':            [],
-        'current_command':         [],
         'command_progress_parser': None,
         'file_in':                 '{library_path}/{test_file_in}',
         'file_out':                '{cache_path}/{test_file_out}',

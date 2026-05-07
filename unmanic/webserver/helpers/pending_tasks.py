@@ -30,13 +30,9 @@
 
 """
 import os
+
 from unmanic.libs import task
-from unmanic.libs import filetest
 from unmanic.libs.library import Library
-from unmanic.libs.logs import UnmanicLogging
-
-
-logger = UnmanicLogging.get_logger(name=__name__)
 
 
 def prepare_filtered_pending_tasks_for_table(request_dict):
@@ -112,7 +108,6 @@ def prepare_filtered_pending_tasks(params, include_library=False):
     length = params.get('length', 0)
 
     search_value = params.get('search_value', '')
-    library_ids = params.get('library_ids') or []
 
     order = params.get('order', {
         "column": 'priority',
@@ -124,23 +119,12 @@ def prepare_filtered_pending_tasks(params, include_library=False):
     # Get total count
     records_total_count = task_handler.get_total_task_list_count()
     # Get quantity after filters (without pagination)
-    records_filtered_count = task_handler.get_task_list_filtered_and_sorted(
-        order=order,
-        start=0,
-        length=0,
-        search_value=search_value,
-        status='pending',
-        library_ids=library_ids
-    ).count()
+    records_filtered_count = task_handler.get_task_list_filtered_and_sorted(order=order, start=0, length=0,
+                                                                            search_value=search_value,
+                                                                            status='pending').count()
     # Get filtered/sorted results
-    pending_task_results = task_handler.get_task_list_filtered_and_sorted(
-        order=order,
-        start=start,
-        length=length,
-        search_value=search_value,
-        status='pending',
-        library_ids=library_ids
-    )
+    pending_task_results = task_handler.get_task_list_filtered_and_sorted(order=order, start=start, length=length,
+                                                                          search_value=search_value, status='pending')
 
     # Build return data
     return_data = {
@@ -168,41 +152,6 @@ def prepare_filtered_pending_tasks(params, include_library=False):
 
     # Return results
     return return_data
-
-
-def get_filtered_pending_task_ids(params, exclude_ids=None):
-    """
-    Returns a list of pending task IDs filtered according to the provided request.
-
-    :param params:
-    :param exclude_ids:
-    :return:
-    """
-    search_value = params.get('search_value', '')
-    library_ids = params.get('library_ids') or []
-
-    exclude_set = set(exclude_ids or [])
-
-    task_handler = task.Task()
-    query = task_handler.get_task_list_filtered_and_sorted(
-        order=None,
-        start=0,
-        length=0,
-        search_value=search_value,
-        status='pending',
-        library_ids=library_ids
-    )
-
-    id_list = []
-    for record in query:
-        task_id = record.get('id')
-        if task_id is None:
-            continue
-        if task_id in exclude_set:
-            continue
-        id_list.append(task_id)
-
-    return id_list
 
 
 def remove_pending_tasks(pending_task_ids):
@@ -356,31 +305,4 @@ def create_task(abspath, library_id=1, library_name=None, task_type='local', pri
         "type":       task_info.get('type'),
         "status":     task_info.get('status'),
         "library_id": task_info.get('library_id'),
-    }
-
-
-def test_path_for_pending_task(abspath, library_id):
-    """
-    Test a file path against library file test plugins without queueing a task.
-
-    :param abspath:
-    :param library_id:
-    :return:
-    """
-    file_tester = filetest.FileTest(library_id)
-    add_file_to_pending_tasks, file_issues, priority_score_modification, decision_plugin = (
-        file_tester.should_file_be_added_to_task_list(abspath)
-    )
-
-    for issue in file_issues:
-        if isinstance(issue, dict):
-            logger.info(issue.get('message'))
-        else:
-            logger.info(issue)
-
-    return {
-        'add_file_to_pending_tasks': add_file_to_pending_tasks,
-        'issues':                   file_issues,
-        'priority_score':           priority_score_modification,
-        'decision_plugin':          decision_plugin,
     }

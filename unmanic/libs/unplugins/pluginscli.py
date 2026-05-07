@@ -29,6 +29,7 @@
            OR OTHER DEALINGS IN THE SOFTWARE.
 
 """
+import atexit
 import json
 import logging
 import os
@@ -43,7 +44,9 @@ from . import plugin_types
 from unmanic import config
 from unmanic.libs import common
 from unmanic.libs.plugins import PluginsHandler
+from unmanic.libs.task import TaskDataStore
 from unmanic.libs.unplugins import PluginExecutor
+from unmanic.libs.unplugins.child_process import kill_all_plugin_processes, set_shared_manager
 from ..logs import UnmanicLogging
 
 home_directory = common.get_home_dir()
@@ -123,6 +126,8 @@ def print_table(table_data, col_list=None, sep='\uFFFA', max_col_width=9):
 class PluginsCLI(object):
 
     def __init__(self, plugins_directory=None):
+        from multiprocessing import Manager
+
         # Read settings
         self.settings = config.Config()
 
@@ -142,6 +147,14 @@ class PluginsCLI(object):
         UnmanicLogging.enable_debugging()
         self.logger = UnmanicLogging.get_logger(name=__class__.__name__)
 
+        # Ensure PluginChildProcess has a shared manager during CLI tests.
+        self._mgr = Manager()
+        atexit.register(self._mgr.shutdown)
+        atexit.register(kill_all_plugin_processes)
+        TaskDataStore._runner_state = self._mgr.dict()
+        TaskDataStore._task_state = self._mgr.dict()
+        set_shared_manager(self._mgr)
+
         self.test_data_modifiers = {
             "{cache_path}":    dev_cache_directory,
             "{library_path}":  dev_library_directory,
@@ -149,45 +162,121 @@ class PluginsCLI(object):
             "{test_file_out}": "Big_Buck_Bunny_1080_10s_30MB_h264-1616571944.7296877-WORKING-1.mkv"
         }
 
-    def create_new_plugins(self):
+    def _get_plugin_type_choices(self):
+        # Get list of plugin types
+        all_plugin_types = plugin_types.get_all_plugin_types()
+
+        # Build choice selection list from installed plugins
+        plugin_details_by_name = {}
+        plugin_details_by_runner = {}
+        choices = []
+        for plugin_type in all_plugin_types:
+            plugin_type_details = all_plugin_types[plugin_type]
+            plugin_name = plugin_type_details.get('name')
+            plugin_runner = plugin_type_details.get('runner')
+            choices.append(plugin_name)
+            plugin_details_by_name[plugin_name] = plugin_type_details
+            plugin_details_by_runner[plugin_runner] = plugin_type_details
+
+        return choices, plugin_details_by_name, plugin_details_by_runner
+
+    @staticmethod
+    def _normalize_plugin_id(plugin_id):
+        # Ensure plugin ID has only underscore and a-z, 0-9
+        plugin_id = re.sub('[^0-9a-zA-Z]+', '_', plugin_id)
+        # Ensure plugin ID is lower case
+        return plugin_id.lower()
+
+    @staticmethod
+    def _order_plugin_type_details(plugin_type_details_list):
+        runner_priority = [
+            "on_library_management_file_test",
+            "on_worker_process",
+            "on_postprocessor_file_movement",
+            "on_postprocessor_task_results",
+            "render_frontend_panel",
+            "render_plugin_api",
+        ]
+        priority_lookup = {runner: index for index, runner in enumerate(runner_priority)}
+        emit_priority = len(runner_priority)
+        fallback_priority = emit_priority + 1
+
+        def sort_key(details):
+            runner = details.get('runner') or ''
+            if runner.startswith('emit_'):
+                return (emit_priority, runner)
+            if runner in priority_lookup:
+                return (priority_lookup[runner], runner)
+            # Any runner not in the priority list should always come last.
+            return (fallback_priority, runner)
+
+        return sorted(plugin_type_details_list, key=sort_key)
+
+    def _parse_runner_inputs(self, runner_inputs, plugin_details_by_name, plugin_details_by_runner):
+        runner_inputs = runner_inputs or []
+        if isinstance(runner_inputs, str):
+            runner_inputs = [runner_inputs]
+
+        runner_tokens = []
+        for runner_input in runner_inputs:
+            runner_tokens.extend([token.strip() for token in runner_input.split(',') if token.strip()])
+
+        if not runner_tokens:
+            return None, ["No runner types specified."]
+
+        selected_details = []
+        invalid_tokens = []
+        selected_runners = set()
+        for token in runner_tokens:
+            plugin_type_details = plugin_details_by_runner.get(token) or plugin_details_by_name.get(token)
+            if not plugin_type_details:
+                invalid_tokens.append(token)
+                continue
+            runner = plugin_type_details.get('runner')
+            if runner in selected_runners:
+                continue
+            selected_runners.add(runner)
+            selected_details.append(plugin_type_details)
+
+        if invalid_tokens:
+            return None, ["Invalid runner types: {}".format(', '.join(invalid_tokens))]
+
+        return selected_details, []
+
+    def _collect_new_plugin_details(self):
         plugin_details = inquirer.prompt(menus.get('create_plugin'))
 
         # Ensure results are not empty
         if not plugin_details.get('plugin_name') or not plugin_details.get('plugin_id'):
             print("ERROR! Invalid input.")
-            return
+            return None, None
 
-        # Ensure plugin ID has only underscore and a-z, 0-9
-        plugin_details['plugin_id'] = re.sub('[^0-9a-zA-Z]+', '_', plugin_details.get('plugin_id'))
-        # Ensure plugin ID is lower case
-        plugin_details['plugin_id'] = plugin_details.get('plugin_id').lower()
+        plugin_details['plugin_id'] = self._normalize_plugin_id(plugin_details.get('plugin_id'))
 
-        # Get list of plugin types
-        all_plugin_types = plugin_types.get_all_plugin_types()
-
-        # Build choice selection list from installed plugins
-        plugin_details_by_runner = {}
-        choices = []
-        for plugin_type in all_plugin_types:
-            choices.append(all_plugin_types[plugin_type].get('name'))
-            plugin_details_by_runner[all_plugin_types[plugin_type].get('name')] = all_plugin_types[plugin_type]
+        choices, plugin_details_by_name, _ = self._get_plugin_type_choices()
 
         # Generate menu menu
         print()
         print('INFO: https://docs.unmanic.app/docs/development/writing_plugins/plugin_runner_types')
-        plugin_runners_inquirer = inquirer.List(
-            'selected_plugin',
-            message="Which Plugin runner will be used?",
+        plugin_runners_inquirer = inquirer.Checkbox(
+            'selected_plugins',
+            message="Which Plugin runner(s) will be used?",
             choices=choices,
         )
 
         # Prompt for selection of Plugin by ID
         runner_selection = inquirer.prompt([plugin_runners_inquirer])
+        selected_plugin_names = runner_selection.get('selected_plugins') if runner_selection else []
+        if not selected_plugin_names:
+            print("ERROR! No plugin runner selected.")
+            return None, None
 
         # Fetch plugin type details from selection
-        plugin_type_details = plugin_details_by_runner[runner_selection.get('selected_plugin')]
-        selected_plugin_runner = plugin_type_details.get('runner')
-        selected_plugin_runner_docstring = plugin_type_details.get('runner_docstring')
+        plugin_type_details_list = [plugin_details_by_name[name] for name in selected_plugin_names]
+        return plugin_details, plugin_type_details_list
+
+    def create_new_plugin_files(self, plugin_details, plugin_type_details_list):
+        ordered_plugin_type_details = self._order_plugin_type_details(plugin_type_details_list)
 
         # Create new plugin path
         new_plugin_path = os.path.join(self.plugins_directory, plugin_details.get('plugin_id'))
@@ -216,13 +305,18 @@ class PluginsCLI(object):
             "",
         ]
 
-        # Create runner function template
-        runner_template = [
-            'def {}(data):'.format(selected_plugin_runner),
-            '    """{}'.format(selected_plugin_runner_docstring),
-            '    """',
-            '    return',
-        ]
+        # Create runner function templates
+        runner_templates = []
+        for plugin_type_details in ordered_plugin_type_details:
+            selected_plugin_runner = plugin_type_details.get('runner')
+            selected_plugin_runner_docstring = plugin_type_details.get('runner_docstring')
+            runner_templates.extend([
+                'def {}(data):'.format(selected_plugin_runner),
+                '    """{}'.format(selected_plugin_runner_docstring),
+                '    """',
+                '    return',
+                '',
+            ])
 
         # Write above templates to main python file
         main_python_file = os.path.join(new_plugin_path, 'plugin.py')
@@ -232,11 +326,14 @@ class PluginsCLI(object):
                 for template_line in main_plugin_template:
                     outfile.write("{}\n".format(template_line))
                 # Write out runner function template
-                for template_line in runner_template:
+                for template_line in runner_templates:
                     outfile.write("{}\n".format(template_line))
 
         # Write plugin info.json
         info_file = os.path.join(new_plugin_path, 'info.json')
+        priorities = {}
+        for plugin_type_details in ordered_plugin_type_details:
+            priorities[plugin_type_details.get('runner')] = 0
         plugin_info = {
             "id":            plugin_details.get('plugin_id'),
             "name":          plugin_details.get('plugin_name'),
@@ -246,7 +343,7 @@ class PluginsCLI(object):
             "description":   "",
             "icon":          "",
             "priorities":    {
-                selected_plugin_runner: 0
+                **priorities
             },
             "compatibility": [PluginsHandler.version]
         }
@@ -279,6 +376,34 @@ class PluginsCLI(object):
             return
 
         print("Plugin created - '{}'".format((plugin_details.get('plugin_id'))))
+
+    def create_new_plugins(self):
+        plugin_details, plugin_type_details_list = self._collect_new_plugin_details()
+        if not plugin_details or not plugin_type_details_list:
+            return
+        self.create_new_plugin_files(plugin_details, plugin_type_details_list)
+
+    def create_new_plugins_from_args(self, plugin_id, plugin_name, runner_inputs):
+        if not plugin_id or not plugin_name:
+            print("ERROR! Missing plugin_id or plugin_name.")
+            return
+
+        plugin_details = {
+            'plugin_id':   self._normalize_plugin_id(plugin_id),
+            'plugin_name': plugin_name,
+        }
+
+        _, plugin_details_by_name, plugin_details_by_runner = self._get_plugin_type_choices()
+        plugin_type_details_list, errors = self._parse_runner_inputs(
+            runner_inputs,
+            plugin_details_by_name,
+            plugin_details_by_runner,
+        )
+        if errors:
+            print("ERROR! {}".format(" ".join(errors)))
+            return
+
+        self.create_new_plugin_files(plugin_details, plugin_type_details_list)
 
     def reload_plugin_from_disk(self):
         # Fetch list of installed plugins
@@ -335,6 +460,27 @@ class PluginsCLI(object):
 
         # Remove the selected Plugin by ID
         plugin_table_id = table_ids[selection.get('cli_action')]
+        self._uninstall_plugin_by_db_table_id(plugin_table_id)
+
+    def remove_plugin_by_id(self, plugin_id):
+        if not plugin_id:
+            print("ERROR! Missing plugin_id.")
+            return
+
+        plugin_results = self.__get_installed_plugins(plugin_id=plugin_id)
+        if not plugin_results:
+            print("ERROR! Plugin not found: '{}'".format(plugin_id))
+            return
+
+        plugin_table_id = plugin_results[0].get('id')
+        if not plugin_table_id:
+            print("ERROR! Plugin record missing id for '{}'.".format(plugin_id))
+            return
+
+        self._uninstall_plugin_by_db_table_id(plugin_table_id)
+
+    @staticmethod
+    def _uninstall_plugin_by_db_table_id(plugin_table_id):
         plugins = PluginsHandler()
         plugins.uninstall_plugins_by_db_table_id([plugin_table_id])
         print()
@@ -386,7 +532,8 @@ class PluginsCLI(object):
             else:
                 formatted_plugin_settings = json.dumps(plugin_settings, indent=1)
                 formatted_plugin_settings = formatted_plugin_settings.replace('\n', '\n' + '                    ')
-                print("        - {1}Settings: {0}{2}".format(formatted_plugin_settings, BColours.RESULTS, BColours.ENDC))
+                print("        - {1}Settings: {0}{2}".format(formatted_plugin_settings,
+                      BColours.RESULTS, BColours.ENDC))
                 print("        -- {}PASSED{} --".format(BColours.OKGREEN, BColours.ENDC))
 
             # Test Plugin runners
@@ -482,6 +629,7 @@ class PluginsCLI(object):
             "Big_Buck_Bunny_1080_10s_30MB_h264.mkv": "https://test-videos.co.uk/vids/bigbuckbunny/mkv/1080/Big_Buck_Bunny_1080_10s_30MB.mkv",
             "Big_Buck_Bunny_1080_10s_30MB_h264.mp4": "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/1080/Big_Buck_Bunny_1080_10s_30MB.mp4",
             "Big_Buck_Bunny_1080_10s_30MB_av1.mp4":  "https://test-videos.co.uk/vids/bigbuckbunny/mp4/av1/1080/Big_Buck_Bunny_1080_10s_30MB.mp4",
+            "Big_Buck_Bunny_360_10s_1MB_h264.mp4":  "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4",
             "sample-12s.mp3":                        "https://download.samplelib.com/mp3/sample-12s.mp3",
         }
         if not os.path.exists(dev_cache_directory):
@@ -501,7 +649,8 @@ class PluginsCLI(object):
                             f.write(chunk)
 
             split_file_in = os.path.splitext(key)
-            cache_file = os.path.join(dev_cache_directory, "{}-{}{}".format(split_file_in[0], "WORKING-1", split_file_in[1]))
+            cache_file = os.path.join(
+                dev_cache_directory, "{}-{}{}".format(split_file_in[0], "WORKING-1", split_file_in[1]))
             shutil.copyfile(library_file, cache_file)
 
     def main(self, arg):
@@ -519,6 +668,35 @@ class PluginsCLI(object):
         else:
             self.logger.info("Invalid selection")
             return
+
+    def run_from_args(self, args):
+        if args.test_file_in:
+            self.test_data_modifiers['{test_file_in}'] = args.test_file_in
+        if args.test_file_out:
+            self.test_data_modifiers['{test_file_out}'] = args.test_file_out
+        if args.create_plugin:
+            self.create_new_plugins_from_args(
+                plugin_id=args.plugin_id,
+                plugin_name=args.plugin_name,
+                runner_inputs=args.plugin_runners,
+            )
+            return
+        if args.test_plugin:
+            self.test_installed_plugins(plugin_id=args.test_plugin)
+            return
+        if args.test_plugins:
+            self.test_installed_plugins()
+            return
+        if args.reload_plugins:
+            self.reload_plugin_from_disk()
+            return
+        if args.remove_plugin:
+            self.remove_plugin_by_id(args.plugin_id)
+            return
+        if args.install_test_data:
+            self.install_test_data()
+            return
+        self.logger.info("Invalid plugin CLI arguments")
 
     def run(self):
         print()

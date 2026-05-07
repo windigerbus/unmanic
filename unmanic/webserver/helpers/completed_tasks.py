@@ -34,6 +34,21 @@ import time
 from datetime import date, datetime
 
 from unmanic.libs import common, history, task
+from unmanic.libs.unmodels import FileMetadataPaths
+
+
+def _parse_datetime_to_timestamp(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.timestamp()
+    if isinstance(value, str):
+        for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M'):
+            try:
+                return datetime.strptime(value, fmt).timestamp()
+            except ValueError:
+                continue
+    return None
 
 
 def prepare_filtered_completed_tasks(params):
@@ -62,13 +77,8 @@ def prepare_filtered_completed_tasks(params):
     elif status == 'failed':
         task_success = False
 
-    after_time = None
-    if params.get('after'):
-        after_time = datetime.strptime(params.get('after'), '%Y-%m-%dT%H:%M:%S').timestamp()
-
-    before_time = None
-    if params.get('before'):
-        before_time = datetime.strptime(params.get('before'), '%Y-%m-%dT%H:%M:%S').timestamp()
+    after_time = _parse_datetime_to_timestamp(params.get('after'))
+    before_time = _parse_datetime_to_timestamp(params.get('before'))
 
     # Fetch historical tasks
     history_logging = history.History()
@@ -99,6 +109,13 @@ def prepare_filtered_completed_tasks(params):
         "results":         []
     }
 
+    matched_paths = set()
+    task_paths = [task.get('abspath') for task in task_results if task.get('abspath')]
+    if task_paths:
+        query = FileMetadataPaths.select(FileMetadataPaths.path).where(FileMetadataPaths.path.in_(task_paths))
+        for row in query:
+            matched_paths.add(row.path)
+
     # Iterate over tasks and append them to the task data
     for task in task_results:
         # Set params as required in template
@@ -106,12 +123,59 @@ def prepare_filtered_completed_tasks(params):
             'id':           task['id'],
             'task_label':   task['task_label'],
             'task_success': task['task_success'],
+            'start_time':   task['start_time'],
             'finish_time':  task['finish_time'],
+            'has_metadata': task.get('abspath') in matched_paths,
         }
         return_data["results"].append(item)
 
     # Return results
     return return_data
+
+
+def get_filtered_completed_task_ids(params, exclude_ids=None):
+    """
+    Returns a list of completed task IDs filtered according to the provided request.
+
+    :param params:
+    :param exclude_ids:
+    :return:
+    """
+    search_value = params.get('search_value', '')
+    status = params.get('status', 'all')
+
+    task_success = None
+    if status == 'success':
+        task_success = True
+    elif status == 'failed':
+        task_success = False
+
+    after_time = _parse_datetime_to_timestamp(params.get('after'))
+    before_time = _parse_datetime_to_timestamp(params.get('before'))
+
+    exclude_set = set(exclude_ids or [])
+
+    history_logging = history.History()
+    query = history_logging.get_historic_task_list_filtered_and_sorted(
+        order=None,
+        start=0,
+        length=0,
+        search_value=search_value,
+        task_success=task_success,
+        after_time=after_time,
+        before_time=before_time
+    )
+
+    id_list = []
+    for record in query:
+        task_id = record.get('id')
+        if task_id is None:
+            continue
+        if task_id in exclude_set:
+            continue
+        id_list.append(task_id)
+
+    return id_list
 
 
 def remove_completed_tasks(completed_task_ids):

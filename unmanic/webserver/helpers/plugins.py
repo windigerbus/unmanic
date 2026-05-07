@@ -259,6 +259,10 @@ def get_plugin_settings(plugin_id: str, library_id=None):
                 "checkbox",
                 "slider",
                 "browse_directory",
+                "section_header",
+                "section_subheader",
+                "section_details",
+                "section_admonition",
             ]
             if form_input['input_type'] not in supported_input_types:
                 form_input['input_type'] = "text"
@@ -387,7 +391,7 @@ def prepare_plugin_info_and_settings(plugin_id, prefer_local=True, library_id=No
         if plugin_installed:
             plugin_data['settings'] = get_plugin_settings(plugin_result.get('plugin_id'), library_id=library_id)
             plugin_data['changelog'] = "".join(get_plugin_changelog(plugin_result.get('plugin_id')))
-            plugin_data['description'] += "\n" + "".join(
+            plugin_data['description'] += "\n\n" + "".join(
                 get_plugin_long_description(plugin_result.get('plugin_id')))
         break
 
@@ -435,6 +439,11 @@ def update_plugin_settings(plugin_id, settings, library_id=None):
         key = s.get('key')
         key_id = s.get('key_id')
         input_type = s.get('input_type')
+
+        # Skip section headers
+        if input_type in ['section_header', 'section_subheader', 'section_details', 'section_admonition']:
+            continue
+
         # Check if setting is in params
         value = s.get('value')
         # Check if value should be boolean
@@ -536,9 +545,13 @@ def prepare_plugin_repos_list():
         repo_id = plugins.get_plugin_repo_id(repo_path)
         repo_data = plugins.read_repo_data(repo_id)
         repo_metadata = repo_data.get('repo', {})
-        repo['id'] = repo_metadata.get('id')
-        repo['icon'] = repo_metadata.get('icon')
-        repo['name'] = repo_metadata.get('name')
+        repo['id'] = repo_metadata.get('id') or repo_metadata.get('repo_id') or ''
+        repo['icon'] = repo_metadata.get('icon') or repo_metadata.get('repo_icon_url') or ''
+        repo['name'] = repo_metadata.get('name') or repo_metadata.get('repo_name') or ''
+        repo['repo_html_url'] = repo_metadata.get('repo_html_url') or ''
+        if not repo['name']:
+            logger.warning("Repo metadata missing name for repo path '%s'", repo.get('path'))
+            repo['name'] = "Unknown Repo"
 
     return return_repos
 

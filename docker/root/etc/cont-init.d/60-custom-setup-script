@@ -1,21 +1,116 @@
-#!/usr/bin/with-contenv bash
+#!/usr/bin/env bash
 
+warn_if_risky_nonroot() {
+    local script_path="$1"
+    local risky_keywords=("apt" "apt-get" "aptitude" "dpkg")
+    for kw in "${risky_keywords[@]}"; do
+        if grep -Eq "\\b${kw}\\b" "${script_path}" 2>/dev/null; then
+            echo "**** (custom-setup-script) WARNING: '${script_path}' contains '${kw}' but container is not running as root; commands may fail with insufficent permissions ****"
+            return
+        fi
+    done
+}
+
+run_init_script() {
+    local script_path="$1"
+    local had_errexit=0
+    local had_nounset=0
+    local had_pipefail=0
+    local status=0
+
+    if [[ $- == *e* ]]; then
+        had_errexit=1
+        set +e
+    fi
+    if [[ $- == *u* ]]; then
+        had_nounset=1
+        set +u
+    fi
+    if set -o | grep -Eq '^pipefail[[:space:]]+on$'; then
+        had_pipefail=1
+        set +o pipefail
+    fi
+
+    (
+        trap - ERR
+        source "${script_path}"
+    )
+    status=$?
+
+    if [[ "${had_pipefail}" -eq 1 ]]; then
+        set -o pipefail
+    fi
+    if [[ "${had_nounset}" -eq 1 ]]; then
+        set -u
+    fi
+    if [[ "${had_errexit}" -eq 1 ]]; then
+        set -e
+    fi
+
+    return "${status}"
+}
 
 if [[ -f /config/startup.sh ]]; then
-
-    echo "**** (custom-setup-script) Calling custom user setup script ****";
+    echo "**** (custom-setup-script) Calling custom user setup script ****"
     sed -i 's/\r$//' /config/startup.sh
-    source /config/startup.sh
+    if [[ "${EUID}" -ne 0 ]]; then
+        warn_if_risky_nonroot "/config/startup.sh"
+    fi
+    startup_status=0
+    if run_init_script "/config/startup.sh"; then
+        startup_status=0
+    else
+        startup_status=$?
+    fi
 
+    if [[ "${startup_status}" -ne 0 ]]; then
+        echo "**** (custom-setup-script) ERROR: /config/startup.sh failed with exit code ${startup_status}; continuing initialization ****"
+    fi
 fi
 
-for plugin_script in /config/.unmanic/plugins/*/init.d/*.sh ; do
+for user_init_script in /config/init.d/*.sh; do
+
+    if [[ -e "${user_init_script}" ]]; then
+
+        echo "[60-custom-setup-script] ${user_init_script}: executing..."
+        sed -i 's/\r$//' "${user_init_script}"
+        if [[ "${EUID}" -ne 0 ]]; then
+            warn_if_risky_nonroot "${user_init_script}"
+        fi
+        user_init_status=0
+        if run_init_script "${user_init_script}"; then
+            user_init_status=0
+        else
+            user_init_status=$?
+        fi
+
+        if [[ "${user_init_status}" -ne 0 ]]; then
+            echo "**** (custom-setup-script) ERROR: ${user_init_script} failed with exit code ${user_init_status}; continuing initialization ****"
+        fi
+
+    fi
+
+done
+
+for plugin_script in /config/.unmanic/plugins/*/init.d/*.sh; do
 
     if [[ -e "${plugin_script}" ]]; then
 
         echo "[60-custom-setup-script] ${plugin_script}: executing..."
         sed -i 's/\r$//' "${plugin_script}"
-        source "${plugin_script}"
+        if [[ "${EUID}" -ne 0 ]]; then
+            warn_if_risky_nonroot "${plugin_script}"
+        fi
+        plugin_status=0
+        if run_init_script "${plugin_script}"; then
+            plugin_status=0
+        else
+            plugin_status=$?
+        fi
+
+        if [[ "${plugin_status}" -ne 0 ]]; then
+            echo "**** (custom-setup-script) ERROR: ${plugin_script} failed with exit code ${plugin_status}; continuing initialization ****"
+        fi
 
     fi
 
